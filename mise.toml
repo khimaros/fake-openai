@@ -1,0 +1,3 @@
+# deterministic rust toolchain for fake-openai builds.
+[tools]
+rust = "1.95.0"
