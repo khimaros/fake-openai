@@ -27,11 +27,13 @@ tiny_http accept (one thread per request)
   -> body -> serde_json::Value (fallback {"_raw": <utf8-lossy>})
   -> path starts with /__admin? -> admin handler (NOT captured)
   -> else: capture {path, headers, body} into State + optional jsonl sink
+  -> /upstream/<model>/v1/... ? -> strip prefix if llamaswap on, else 404
   -> router dispatch by (method, path):
        POST /v1/chat/completions   -> handlers::chat
        POST /v1/audio/speech       -> handlers::audio (tts)
        POST /v1/audio/transcriptions -> handlers::audio (stt)
-       GET  /v1/audio/voices       -> handlers::audio
+       GET/POST /v1/audio/voices   -> handlers::audio (list / clone)
+       POST /v1/images/generations -> handlers::images
        GET  /v1/models[/{id}]      -> handlers::models
        (no match)                  -> 404 with an endpoint listing
   -> non-admin: pay connect_delay_ms (slow-first-byte injection), then capture
@@ -62,6 +64,13 @@ request that matches nothing returns 404 whose body lists every handler's
 are added (the models handler is scoped to `/v1/models`, so a bare `/v1` 404s
 rather than masquerading as a model list). the `/__admin` namespace is matched
 before `/v1` so control-plane paths never collide with api paths.
+
+vendor extensions to the openai surface are gated on a behavior flag rather than
+built into a handler's matcher, so they can be turned off wholesale: the router
+rewrites (or rejects) llama-swap's `/upstream/<model>/v1/*` before dispatch,
+which keeps one implementation per endpoint family and leaves the handlers
+unaware of the gateway. they default off so the mock is a plain
+openai-compatible server unless a caller opts in.
 
 the audio family (`handlers::audio`) covers pi-omni's voice paths: speech returns
 deterministic pcm (raw, or sse `speech.audio.delta` frames when the request asks
@@ -113,6 +122,19 @@ the `validate_chat` behavior (default off) gates chat requests: a missing `model
 or `messages`, or a missing bearer Authorization header, is rejected with an
 openai-style 400/401 before the queue is consumed, so a rejected request leaves
 the programmed sequence intact. left off, the endpoint stays permissive.
+
+the `context_window` behavior (default off) models a bounded server context. when
+set, the chat handler derives a prompt-token count from the request's serialized
+`messages` (at `chars_per_token` characters each, default 4) and, before consuming
+a spec, rejects any request over the window with a `context_length_exceeded` 400 --
+the llama-server overflow shape, leaving the queue intact for the retry. an
+in-window request is served normally but its rendered `usage` is overridden with
+the derived prompt (keeping the spec's completion count). the point is the
+feedback loop a fixed per-turn usage cannot model: a harness that compacts its own
+context keys off the usage a server reports, so a compacted (smaller) request must
+report a smaller usage. deriving usage from the request is what makes shrinking the
+request shrink the reported usage, and thus what lets a compaction/overflow cycle
+be tested end to end.
 
 ## introspection
 

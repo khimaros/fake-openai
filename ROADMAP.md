@@ -50,6 +50,22 @@ driven by pi-serve's need for deterministic streaming, error, and timeout tests.
 - [x] opt-in request validation: a `validate_chat` behavior rejects malformed or
   unauthenticated chat requests with an openai-style 400/401
 
+## v0.5: image, voice, and gateway surface
+
+enough of the surface for a workflow engine (`flow`) to run its real workflows
+against the mock: image generation, voice cloning, and the model metadata a
+client's model picker reads. non-standard vendor behavior is opt-in, so the same
+mock can prove a client works against a plain openai server.
+
+- [x] `POST /v1/images/generations` returning a real decodable png, honoring `n`
+  and `response_format`
+- [x] `POST /v1/audio/voices` voice cloning, echoing the requested voice name
+- [x] model objects carry caller-supplied metadata verbatim (`--models-json`,
+  `PUT /__admin/models`), so modality tags and aliases are readable
+- [x] opt-in `llamaswap` behavior (default off): `/upstream/<model>/v1/*` routes
+  and alias resolution in `/v1/models/{id}`
+- [ ] flow: python e2e suite driving the real workflows against the mock
+
 ## v0.4: shared python test client and an all-python e2e suite
 
 a single stdlib-only python client (`clients/python/fakeopenai.py`) so every
@@ -71,6 +87,24 @@ to silently mask broken wiring).
 
 ## follow-ups
 
+- [x] closed-loop context window: derive response usage from the request size and
+  return a `context_length_exceeded` 400 when a request exceeds a configurable
+  window (`--context-window` / `--chars-per-token`). a fixed per-turn usage cannot
+  reproduce a harness's compaction/overflow feedback loop -- where a compacted
+  (smaller) request must report a smaller usage, which is what decides whether the
+  harness compacts again -- so this closes the loop for context-window testing.
+- [x] speech pcm carries POSITION, not just bytes: `/v1/audio/speech` returns a
+  deterministic ramp instead of 1536 zero bytes, so a consumer can assert the
+  audio it received is the audio that was sent -- in order, unshifted and
+  untruncated. silence proves only that something arrived. raised by hmux's
+  voice face (phase 36), whose two real decoding hazards are a byte-shifted
+  s16_le stream (an odd-length http chunk carried wrong) and a silently dropped
+  sse frame; against a zero payload BOTH look identical to success.
+- [x] `empty_transcript` behavior: `/v1/audio/transcriptions` answers `{"text": ""}`. a
+  transcriber returning NOTHING is a real, ordinary outcome -- whisper's own vad rejects a
+  silent clip and yields an empty string, not an error -- and it is a case consumers get wrong:
+  hmux's voice face said nothing back, leaving a client wedged in "transcribing" forever. the
+  mock could not reproduce it, so nothing caught it.
 - [ ] request matching / stubbing by body (wiremock-style), beyond the
   sequential queue
 - [ ] web ui built on the admin api

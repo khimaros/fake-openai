@@ -27,6 +27,7 @@ const CHAT_PATH: &str = "/v1/chat/completions";
 const SPEECH_PATH: &str = "/v1/audio/speech";
 const TRANSCRIPTIONS_PATH: &str = "/v1/audio/transcriptions";
 const VOICES_PATH: &str = "/v1/audio/voices";
+const IMAGES_PATH: &str = "/v1/images/generations";
 
 // a streaming chat request body, optionally tools-bearing and/or a heartbeat.
 fn chat_body(tools: bool, heartbeat: bool, stream: bool) -> String {
@@ -92,8 +93,17 @@ impl Server {
         }
     }
 
-    // send one request over a fresh connection; return (status, head, body).
+    // send one request over a fresh connection; return (status, head, body). the body is
+    // decoded LOSSILY -- the audio endpoints serve payloads that are not valid utf-8, and a
+    // strict decode here would fail every test that merely posts to one. a test that inspects
+    // audio bytes uses req_bytes instead.
     fn req_full(&self, method: &str, path: &str, body: &str) -> (u16, String, String) {
+        let (status, head, bytes) = self.req_bytes(method, path, body);
+        (status, head, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    // as req_full, but the response body stays BYTES.
+    fn req_bytes(&self, method: &str, path: &str, body: &str) -> (u16, String, Vec<u8>) {
         let mut stream = TcpStream::connect(&self.addr).expect("connect");
         stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         let raw = format!(
@@ -104,9 +114,13 @@ impl Server {
         );
         stream.write_all(raw.as_bytes()).unwrap();
         stream.flush().unwrap();
-        let mut resp = String::new();
-        stream.read_to_string(&mut resp).unwrap();
-        let (head, body) = resp.split_once("\r\n\r\n").unwrap_or((resp.as_str(), ""));
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).unwrap();
+        let split = resp
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("header terminator");
+        let head = String::from_utf8_lossy(&resp[..split]).into_owned();
         let status = head
             .lines()
             .next()
@@ -116,7 +130,7 @@ impl Server {
             .unwrap()
             .parse()
             .unwrap();
-        (status, head.to_string(), body.to_string())
+        (status, head, resp[split + 4..].to_vec())
     }
 
     fn req(&self, method: &str, path: &str, body: &str) -> (u16, String) {
@@ -264,6 +278,56 @@ fn programmed_response_non_stream_json() {
     let v = json(&body);
     assert_eq!(v["object"], "chat.completion");
     assert_eq!(v["choices"][0]["message"]["content"], "hi json");
+}
+
+#[test]
+fn programmed_reasoning_streams_reasoning_content() {
+    let s = Server::spawn(&[]);
+    s.post("/__admin/responses", "{\"reasoning\":\"thinking\",\"content\":\"answer\"}");
+    let (status, body) = s.post(CHAT_PATH, &chat_body(false, false, true));
+    assert_eq!(status, 200);
+    // a reasoning delta (reasoning_content) precedes the visible content delta.
+    assert!(body.contains("reasoning_content"), "no reasoning delta: {body}");
+    assert!(body.contains("thinking"), "reasoning text missing: {body}");
+    assert!(body.contains("answer"), "content missing: {body}");
+    let rpos = body.find("reasoning_content").unwrap();
+    let cpos = body.find("\"content\":\"answer\"").unwrap();
+    assert!(rpos < cpos, "reasoning must stream before content: {body}");
+}
+
+#[test]
+fn programmed_reasoning_non_stream_json() {
+    let s = Server::spawn(&[]);
+    s.post("/__admin/responses", "{\"reasoning\":\"thinking\",\"content\":\"answer\"}");
+    let (_, body) = s.post(CHAT_PATH, &chat_body(false, false, false));
+    let v = json(&body);
+    assert_eq!(v["choices"][0]["message"]["reasoning_content"], "thinking");
+    assert_eq!(v["choices"][0]["message"]["content"], "answer");
+}
+
+#[test]
+fn programmed_reasoning_chunks_stream_one_delta_each() {
+    let s = Server::spawn(&[]);
+    s.post(
+        "/__admin/responses",
+        "{\"reasoning_chunks\":[\"think \",\"more \",\"now\"],\"chunks\":[\"hel\",\"lo\"]}",
+    );
+    let (status, body) = s.post(CHAT_PATH, &chat_body(false, false, true));
+    assert_eq!(status, 200);
+    // one reasoning_content delta per reasoning chunk (incremental thinking).
+    assert_eq!(
+        body.matches("reasoning_content").count(),
+        3,
+        "expected 3 reasoning deltas: {body}"
+    );
+    // and the non-stream concatenation joins them (a second spec for the new request).
+    s.post(
+        "/__admin/responses",
+        "{\"reasoning_chunks\":[\"think \",\"more \",\"now\"],\"chunks\":[\"hel\",\"lo\"]}",
+    );
+    let (_, jbody) = s.post(CHAT_PATH, &chat_body(false, false, false));
+    let v = json(&jbody);
+    assert_eq!(v["choices"][0]["message"]["reasoning_content"], "think more now");
 }
 
 #[test]
@@ -439,14 +503,92 @@ fn tts_speech_raw_pcm() {
     let s = Server::spawn(&[]);
     let body =
         "{\"input\":\"hi\",\"model\":\"tts-1\",\"voice\":\"alloy\",\"response_format\":\"pcm\"}";
-    let (status, head, out) = s.req_full("POST", SPEECH_PATH, body);
+    // reads BYTES: the pcm payload is not valid utf-8 (see req_bytes).
+    let (status, head, out) = s.req_bytes("POST", SPEECH_PATH, body);
     assert_eq!(status, 200);
     assert!(
         head.to_lowercase().contains("content-type: audio/pcm"),
         "{head}"
     );
     assert!(!out.is_empty(), "pcm body empty");
-    assert!(!out.contains("speech.audio.delta"), "raw path returned sse");
+    assert!(
+        !out.windows(18).any(|w| w == b"speech.audio.delta"),
+        "raw path returned sse"
+    );
+}
+
+// the ramp the speech endpoint serves, mirrored here so the test states the contract rather
+// than reading it out of the implementation.
+fn expected_pcm(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+// silence proves only that SOMETHING arrived. a positional payload proves the audio a consumer
+// received is the audio that was sent -- in order, unshifted, untruncated.
+#[test]
+fn tts_speech_pcm_is_positional_not_silence() {
+    let s = Server::spawn(&[]);
+    let body =
+        "{\"input\":\"hi\",\"model\":\"tts-1\",\"voice\":\"alloy\",\"response_format\":\"pcm\"}";
+    let (status, head, pcm) = s.req_bytes("POST", SPEECH_PATH, body);
+    assert_eq!(status, 200);
+    assert!(
+        head.to_lowercase().contains("content-type: audio/pcm"),
+        "{head}"
+    );
+    assert!(!pcm.is_empty(), "pcm body empty");
+    assert_eq!(pcm, expected_pcm(pcm.len()), "pcm is not the expected ramp");
+
+    // the two hazards this exists to catch. the period is coprime with the 2-byte s16_le sample
+    // width, so a single-byte shift cannot coincidentally re-align, and a truncated stream
+    // cannot pass by being a prefix of silence.
+    assert_ne!(pcm[1..], expected_pcm(pcm.len())[..pcm.len() - 1],
+        "a one-byte shift must be detectable");
+    assert_ne!(pcm.len(), 0);
+    assert!(pcm.iter().any(|b| *b != 0), "payload is still silence");
+}
+
+// both transports must deliver the SAME audio: a consumer that decodes sse and one that reads
+// the raw body should be indistinguishable downstream.
+#[test]
+fn tts_speech_sse_audio_matches_the_raw_body() {
+    let s = Server::spawn(&[]);
+    let raw_body =
+        "{\"input\":\"hi\",\"model\":\"tts-1\",\"voice\":\"alloy\",\"response_format\":\"pcm\"}";
+    let (_, _, raw) = s.req_bytes("POST", SPEECH_PATH, raw_body);
+
+    let sse_body = "{\"input\":\"hi\",\"model\":\"tts-1\",\"voice\":\"alloy\",\
+                    \"response_format\":\"pcm\",\"stream_format\":\"sse\"}";
+    let (_, _, out) = s.req_full("POST", SPEECH_PATH, sse_body);
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("data: {\"audio\""))
+        .expect("audio data line");
+    let encoded = json(line.trim_start_matches("data: "))["audio"]
+        .as_str()
+        .expect("audio field")
+        .to_string();
+    assert_eq!(decode_b64(&encoded), raw, "sse audio differs from raw pcm");
+}
+
+// a minimal base64 decoder: the test suite carries no dependencies, and asserting on the
+// DECODED bytes is the whole point -- comparing the encoded string would not catch a payload
+// that encodes cleanly but decodes to the wrong samples.
+fn decode_b64(s: &str) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for c in s.bytes().filter(|c| *c != b'=') {
+        let v = ALPHABET.iter().position(|a| *a == c).expect("base64 char") as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
 }
 
 #[test]
@@ -495,6 +637,22 @@ fn audio_voices_list() {
     let (status, body) = s.get(VOICES_PATH);
     assert_eq!(status, 200);
     assert!(body.contains("alloy"), "{body}");
+}
+
+// a transcriber that hears no speech returns an EMPTY string, not an error. consumers get this
+// wrong (hmux's voice face said nothing back and wedged its client in "transcribing"), so the
+// mock has to be able to produce it.
+#[test]
+fn stt_can_return_an_empty_transcript() {
+    let s = Server::spawn(&["--empty-transcript"]);
+    let (status, body) = s.post(TRANSCRIPTIONS_PATH, "blob");
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["text"], "", "expected an empty transcript: {body}");
+
+    // and the default is still a real transcript, so existing consumers are unaffected.
+    let plain = Server::spawn(&[]);
+    let (_, body) = plain.post(TRANSCRIPTIONS_PATH, "blob");
+    assert!(!json(&body)["text"].as_str().unwrap().is_empty());
 }
 
 #[test]
@@ -755,4 +913,239 @@ fn tool_calls_render_in_stream_and_json() {
         "read"
     );
     assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+}
+
+// --- context-window: derived usage + overflow at the window ---------------
+
+// a non-streaming chat body whose single user message carries `content`.
+fn sized_chat_body(content: &str) -> String {
+    serde_json::json!({
+        "model": "fake-model",
+        "messages": [{"role": "user", "content": content}],
+        "stream": false,
+    })
+    .to_string()
+}
+
+// the prompt tokens the behavior derives for `content`: the serialized messages
+// array length over chars_per_token, rounded up. computed with the same
+// serde_json the binary uses, so it matches byte for byte.
+fn derived_prompt(content: &str, chars_per_token: u64) -> u64 {
+    let messages = serde_json::json!([{"role": "user", "content": content}]);
+    (messages.to_string().len() as u64).div_ceil(chars_per_token)
+}
+
+#[test]
+fn context_window_reports_usage_derived_from_request() {
+    // a window far above any request here: nothing overflows, so this isolates
+    // the usage derivation.
+    let s = Server::spawn(&["--context-window", "1000000"]);
+    s.post("/__admin/responses", "{\"content\":\"ok\"}");
+    let content = "x".repeat(400);
+    let (status, body) = s.post(CHAT_PATH, &sized_chat_body(&content));
+    assert_eq!(status, 200, "{body}");
+    let usage = &json(&body)["usage"];
+    let expected = derived_prompt(&content, 4);
+    assert_eq!(usage["prompt_tokens"], expected, "{body}");
+    assert_eq!(
+        usage["total_tokens"].as_u64().unwrap(),
+        expected + usage["completion_tokens"].as_u64().unwrap(),
+    );
+}
+
+#[test]
+fn context_window_smaller_request_reports_smaller_usage() {
+    // the property a compaction loop depends on: shrinking the request shrinks
+    // the reported usage, so a usage-based trigger sees the reduction.
+    let s = Server::spawn(&["--context-window", "1000000"]);
+    s.post("/__admin/responses", "[{\"content\":\"a\"},{\"content\":\"b\"}]");
+    let (_, big) = s.post(CHAT_PATH, &sized_chat_body(&"x".repeat(4000)));
+    let (_, small) = s.post(CHAT_PATH, &sized_chat_body("x"));
+    let big_prompt = json(&big)["usage"]["prompt_tokens"].as_u64().unwrap();
+    let small_prompt = json(&small)["usage"]["prompt_tokens"].as_u64().unwrap();
+    assert!(big_prompt > small_prompt, "big {big_prompt} small {small_prompt}");
+}
+
+#[test]
+fn context_window_rejects_oversized_request_without_consuming() {
+    // a tiny window: any real message overflows it. the rejection is a 400
+    // context_length_exceeded and the queued spec is left intact for the retry.
+    let s = Server::spawn(&["--context-window", "5"]);
+    s.post("/__admin/responses", "{\"content\":\"unconsumed\"}");
+    assert_eq!(s.pending(), 1);
+    let (status, body) = s.post(CHAT_PATH, &sized_chat_body(&"x".repeat(100)));
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(json(&body)["error"]["code"], "context_length_exceeded");
+    assert_eq!(s.pending(), 1, "an overflowing request must not consume a spec");
+}
+
+#[test]
+fn context_window_serves_request_under_the_window() {
+    let s = Server::spawn(&["--context-window", "1000000"]);
+    s.post("/__admin/responses", "{\"content\":\"served\"}");
+    let (status, body) = s.post(CHAT_PATH, &sized_chat_body("small"));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(json(&body)["choices"][0]["message"]["content"], "served");
+    assert_eq!(s.pending(), 0);
+}
+
+#[test]
+fn chars_per_token_scales_the_derivation() {
+    // halving chars-per-token doubles the derived prompt for the same request.
+    let s = Server::spawn(&["--context-window", "1000000", "--chars-per-token", "2"]);
+    s.post("/__admin/responses", "{\"content\":\"ok\"}");
+    let content = "x".repeat(400);
+    let (_, body) = s.post(CHAT_PATH, &sized_chat_body(&content));
+    assert_eq!(json(&body)["usage"]["prompt_tokens"], derived_prompt(&content, 2));
+}
+
+#[test]
+fn context_window_off_by_default() {
+    // no flag: the spec's own usage is reported verbatim and nothing is rejected.
+    let s = Server::spawn(&[]);
+    s.post(
+        "/__admin/responses",
+        "{\"content\":\"ok\",\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}",
+    );
+    let (status, body) = s.post(CHAT_PATH, &sized_chat_body(&"x".repeat(10000)));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(json(&body)["usage"]["prompt_tokens"], 7);
+}
+
+#[test]
+fn context_window_settable_and_clearable_via_admin() {
+    let s = Server::spawn(&[]);
+    s.post("/__admin/behavior", "{\"context_window\":123,\"chars_per_token\":2}");
+    let (_, body) = s.get("/__admin/behavior");
+    assert_eq!(json(&body)["context_window"], 123);
+    assert_eq!(json(&body)["chars_per_token"], 2);
+    // an explicit null clears the window back to unbounded.
+    s.post("/__admin/behavior", "{\"context_window\":null}");
+    let (_, body) = s.get("/__admin/behavior");
+    assert!(json(&body)["context_window"].is_null(), "{body}");
+}
+
+// a model list carrying llama-swap metadata: modality tags and an alias.
+const LLAMASWAP_MODELS: &str = concat!(
+    "[{\"id\":\"qwen3.6-27b:Q8_0\",\"meta\":{\"llamaswap\":",
+    "{\"aliases\":[\"llm-1\"],\"modsi\":\"text,image\",\"modso\":\"text\"}}},",
+    "{\"id\":\"plain-model\"}]",
+);
+
+#[test]
+fn models_keep_caller_supplied_metadata() {
+    let s = Server::spawn(&[]);
+    assert_eq!(s.req("PUT", "/__admin/models", LLAMASWAP_MODELS).0, 200);
+    let (_, body) = s.get("/v1/models");
+    let data = json(&body)["data"].clone();
+    assert_eq!(data[0]["meta"]["llamaswap"]["modso"], "text");
+    assert_eq!(data[0]["meta"]["llamaswap"]["aliases"][0], "llm-1");
+    // the standard openai fields are filled in for both shapes.
+    assert_eq!(data[0]["object"], "model");
+    assert_eq!(data[1]["id"], "plain-model");
+    assert_eq!(data[1]["object"], "model");
+}
+
+#[test]
+fn models_from_json_flag() {
+    let s = Server::spawn(&["--models-json", LLAMASWAP_MODELS]);
+    let (_, body) = s.get("/v1/models");
+    assert_eq!(json(&body)["data"][0]["id"], "qwen3.6-27b:Q8_0");
+}
+
+#[test]
+fn alias_lookup_requires_llamaswap() {
+    let s = Server::spawn(&[]);
+    s.req("PUT", "/__admin/models", LLAMASWAP_MODELS);
+    // off by default: only the real id resolves.
+    assert_eq!(s.get("/v1/models/qwen3.6-27b:Q8_0").0, 200);
+    assert_eq!(s.get("/v1/models/llm-1").0, 404);
+
+    s.post("/__admin/behavior", "{\"llamaswap\":true}");
+    let (status, body) = s.get("/v1/models/llm-1");
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["id"], "qwen3.6-27b:Q8_0");
+}
+
+#[test]
+fn upstream_routes_require_llamaswap() {
+    let s = Server::spawn(&[]);
+    let path = "/upstream/fake-model/v1/chat/completions";
+    assert_eq!(s.post(path, &chat_body(false, false, true)).0, 404);
+
+    s.post("/__admin/behavior", "{\"llamaswap\":true}");
+    let (status, body) = s.post(path, &chat_body(false, false, true));
+    assert_eq!(status, 200);
+    assert_eq!(body, FALLBACK_SSE);
+}
+
+#[test]
+fn upstream_flag_enables_every_endpoint_family() {
+    let s = Server::spawn(&["--llamaswap"]);
+    assert_eq!(s.post("/upstream/m/v1/audio/speech", "{}").0, 200);
+    assert_eq!(s.post("/upstream/m/v1/images/generations", "{}").0, 200);
+    assert_eq!(s.get("/upstream/m/v1/audio/voices").0, 200);
+}
+
+#[test]
+fn images_return_decodable_png() {
+    let s = Server::spawn(&[]);
+    let (status, body) = s.post(IMAGES_PATH, "{\"prompt\":\"a cat\"}");
+    assert_eq!(status, 200);
+    let data = json(&body)["data"].clone();
+    assert_eq!(data.as_array().unwrap().len(), 1);
+    let b64 = data[0]["b64_json"].as_str().unwrap().to_string();
+    let bytes = b64_decode(&b64);
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "not a png header");
+    assert!(bytes.ends_with(b"IEND\xae\x42\x60\x82"), "truncated png");
+}
+
+#[test]
+fn images_honor_n_and_url_format() {
+    let s = Server::spawn(&[]);
+    let (_, body) = s.post(IMAGES_PATH, "{\"prompt\":\"x\",\"n\":3}");
+    assert_eq!(json(&body)["data"].as_array().unwrap().len(), 3);
+
+    let (_, body) = s.post(IMAGES_PATH, "{\"prompt\":\"x\",\"response_format\":\"url\"}");
+    let url = json(&body)["data"][0]["url"].as_str().unwrap().to_string();
+    assert!(url.starts_with("data:image/png;base64,"), "{url}");
+}
+
+#[test]
+fn voice_clone_echoes_the_requested_name() {
+    let s = Server::spawn(&[]);
+    let body = concat!(
+        "--X\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nnarrator\r\n",
+        "--X\r\nContent-Disposition: form-data; name=\"audio_sample\"; filename=\"a.wav\"\r\n\r\n",
+        "RIFFdata\r\n--X--\r\n",
+    );
+    let (status, resp) = s.post(VOICES_PATH, body);
+    assert_eq!(status, 200);
+    assert_eq!(json(&resp)["id"], "narrator");
+    assert_eq!(json(&resp)["object"], "voice");
+}
+
+#[test]
+fn voice_clone_falls_back_to_a_default_name() {
+    let s = Server::spawn(&[]);
+    let (_, resp) = s.post(VOICES_PATH, "--X\r\nno fields here\r\n--X--\r\n");
+    assert_eq!(json(&resp)["id"], "cloned-voice");
+}
+
+// standard base64 decode, to prove the served image is real png bytes.
+fn b64_decode(s: &str) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    let mut out = Vec::new();
+    for c in s.bytes().filter(|b| *b != b'=') {
+        let v = ALPHABET.iter().position(|a| *a == c).expect("bad base64") as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
 }

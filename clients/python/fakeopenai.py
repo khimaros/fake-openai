@@ -111,8 +111,26 @@ def set_default(admin_url, spec):
 
 
 def set_models(admin_url, ids):
-    """set the model list reported by /v1/models."""
+    """set the model list reported by /v1/models.
+
+    accepts bare id strings or full model objects (see llamaswap_model), which
+    are reported verbatim so a caller can mirror a real server's metadata.
+    """
     _admin(admin_url, "/models", "PUT", list(ids))
+
+
+def llamaswap_model(model_id, aliases=(), modsi="text", modso="text"):
+    """build a /v1/models entry carrying llama-swap metadata.
+
+    `aliases` are the stable names the model also answers to; `modsi`/`modso`
+    are its comma-separated input/output modality tags, which clients read to
+    filter a model picker down to the models a given task can use. serving the
+    alias itself needs the llamaswap behavior enabled.
+    """
+    meta = {"modsi": modsi, "modso": modso}
+    if aliases:
+        meta["aliases"] = list(aliases)
+    return {"id": model_id, "meta": {"llamaswap": meta}}
 
 
 def behavior(admin_url, **kw):

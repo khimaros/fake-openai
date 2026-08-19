@@ -34,6 +34,21 @@ impl Handler for ChatCompletions {
                 return HttpResponse::json(status, &body);
             }
         }
+        // context-window simulation: derive the prompt size from the request and,
+        // if it exceeds the window, reject with a context-overflow 400 BEFORE
+        // consuming a spec, so an oversized request leaves the queue intact (a real
+        // server rejects before generating). otherwise the derived prompt overrides
+        // the reported usage so a compacted, smaller request reports smaller usage.
+        let (window, cpt) = {
+            let b = state.behavior.lock().unwrap();
+            (b.context_window, b.chars_per_token)
+        };
+        let derived_prompt = window.map(|_| behavior::estimate_prompt_tokens(&req.body, cpt));
+        if let (Some(w), Some(p)) = (window, derived_prompt) {
+            if p > w {
+                return overflow_response(p, w);
+            }
+        }
         maybe_stall(state, req);
         // pop the next queued spec when this request is allowed to consume one,
         // else the configured default, else the built-in stream.
@@ -47,6 +62,10 @@ impl Handler for ChatCompletions {
             .or_else(|| state.default_response());
         match spec {
             Some(spec) => {
+                let spec = match derived_prompt {
+                    Some(p) => spec.with_derived_prompt(p),
+                    None => spec,
+                };
                 if spec.delay_ms() > 0 {
                     thread::sleep(Duration::from_millis(spec.delay_ms()));
                 }
@@ -60,6 +79,22 @@ impl Handler for ChatCompletions {
             None => HttpResponse::sse(200, SSE_RESPONSE.as_bytes().to_vec()),
         }
     }
+}
+
+// the openai/llama-server shape for a request that overruns the context window.
+// mirrors the 400 body llama-server returns so a client's overflow-recovery path
+// fires exactly as it would against the real server.
+fn overflow_response(prompt_tokens: u64, window: u64) -> HttpResponse {
+    let message = format!(
+        "request ({prompt_tokens} tokens) exceeds the available context size \
+         ({window} tokens), try increasing it"
+    );
+    let body = json!({"error": {
+        "message": message,
+        "type": "invalid_request_error",
+        "code": "context_length_exceeded",
+    }});
+    HttpResponse::json(400, &body)
 }
 
 fn maybe_stall(state: &Shared, req: &ParsedRequest) {

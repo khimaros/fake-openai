@@ -11,14 +11,25 @@ use crate::capture;
 use crate::handlers::{
     audio::{AudioSpeech, AudioTranscriptions, AudioVoices},
     chat::ChatCompletions,
+    images::ImagesGenerations,
     models::Models,
     Handler,
 };
 use crate::response::{HttpResponse, ParsedRequest};
 use crate::state::Shared;
 
+const UPSTREAM_PREFIX: &str = "/upstream/";
+
 pub struct Router {
     handlers: Vec<Box<dyn Handler + Send + Sync>>,
+}
+
+// "/upstream/<model>/v1/chat/completions" -> "/v1/chat/completions". None when
+// the path is not an upstream route.
+fn strip_upstream_prefix(path: &str) -> Option<String> {
+    let rest = path.strip_prefix(UPSTREAM_PREFIX)?;
+    let (_model, tail) = rest.split_once("/v1/")?;
+    Some(format!("/v1/{tail}"))
 }
 
 impl Router {
@@ -30,6 +41,7 @@ impl Router {
                 Box::new(AudioSpeech),
                 Box::new(AudioTranscriptions),
                 Box::new(AudioVoices),
+                Box::new(ImagesGenerations),
                 Box::new(Models),
             ],
         }
@@ -47,6 +59,19 @@ impl Router {
             thread::sleep(Duration::from_millis(connect_delay));
         }
         capture::record(state, req);
+        // llama-swap fronts each model at /upstream/<model>/v1/..., which clients
+        // fall back to when the plain path fails. strip the prefix and serve it
+        // with the same handlers, so both routes reach one implementation. with
+        // the extension off the whole namespace 404s, so a caller can prove its
+        // client works against a plain openai server.
+        let path = if path.starts_with(UPSTREAM_PREFIX) {
+            match state.llamaswap_enabled() {
+                true => strip_upstream_prefix(&path).unwrap_or(path),
+                false => return self.not_found(&req.method, &path),
+            }
+        } else {
+            path
+        };
         for handler in &self.handlers {
             if handler.matches(&req.method, &path) {
                 return handler.handle(state, req);

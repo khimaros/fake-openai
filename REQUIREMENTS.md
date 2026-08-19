@@ -42,3 +42,9 @@ product requirements for `fake-openai`. these must not regress in a release.
     so the permissive default never regresses) rejects a request missing a
     `model`, missing `messages`, or lacking a bearer Authorization header with an
     openai-style 400/401.
+14. optionally simulate a context window: a `context_window` behavior (default
+    off, so fixed per-spec usage never regresses) derives the reported prompt/
+    total usage from the request's serialized `messages` at a configurable
+    `chars_per_token` (default 4), and rejects a request whose derived prompt
+    exceeds the window with a `context_length_exceeded` 400 before the queue is
+    consumed. this closes the feedback loop a harness's own compaction depends on.

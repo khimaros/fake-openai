@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use crate::behavior::Behavior;
-use crate::config::Config;
+use crate::config::{normalize_model, Config};
 use crate::responses::{push_specs, ResponseSpec};
 
 pub type Shared = Arc<State>;
@@ -20,9 +20,35 @@ pub struct State {
     pub default_response: Mutex<Option<ResponseSpec>>,
     pub behavior: Mutex<Behavior>,
     pub stalled_once: Mutex<bool>,
-    pub models: Mutex<Vec<String>>,
+    pub models: Mutex<Vec<Value>>,
     pub log_file: Mutex<Option<File>>,
     pub log_stdout: bool,
+    /// Raw s16le pcm served by `/v1/audio/speech` when `--speech-file` was given; None keeps the
+    /// built-in positional ramp. Read once at boot so a request costs no io.
+    pub speech_pcm: Option<Vec<u8>>,
+}
+
+/// The samples of a wav, or the bytes as-is when they are already raw pcm.
+///
+/// Only the minimum of RIFF is parsed: find `data`, take what follows. A fixture is produced by a
+/// tts endpoint or espeak, both of which write canonical 16-bit mono, and guessing at anything
+/// more elaborate would fail silently as noise rather than loudly as an error.
+fn raw_pcm(bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" {
+        return bytes;
+    }
+    let mut at = 12;
+    while at + 8 <= bytes.len() {
+        let id = &bytes[at..at + 4];
+        let len = u32::from_le_bytes([bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]])
+            as usize;
+        if id == b"data" {
+            let end = (at + 8 + len).min(bytes.len());
+            return bytes[at + 8..end].to_vec();
+        }
+        at += 8 + len + (len & 1);
+    }
+    bytes
 }
 
 impl State {
@@ -43,6 +69,11 @@ impl State {
             models: Mutex::new(c.models.clone()),
             log_file: Mutex::new(log_file),
             log_stdout: c.log_stdout,
+            speech_pcm: c.speech_file.as_ref().map(|p| {
+                let bytes = std::fs::read(p)
+                    .unwrap_or_else(|e| panic!("read speech file {}: {e}", p.display()));
+                raw_pcm(bytes)
+            }),
         }
     }
 
@@ -116,6 +147,10 @@ impl State {
             "consume_only_with_tools": b.consume_only_with_tools,
             "connect_delay_ms": b.connect_delay_ms,
             "validate_chat": b.validate_chat,
+            "context_window": b.context_window,
+            "chars_per_token": b.chars_per_token,
+            "llamaswap": b.llamaswap,
+            "empty_transcript": b.empty_transcript,
         })
     }
 
@@ -142,13 +177,32 @@ impl State {
         if let Some(v) = body.get("validate_chat").and_then(|x| x.as_bool()) {
             b.validate_chat = v;
         }
+        // an explicit null clears the window (back to unbounded); a number sets it.
+        if let Some(v) = body.get("context_window") {
+            b.context_window = if v.is_null() { None } else { v.as_u64() };
+        }
+        if let Some(v) = body.get("chars_per_token").and_then(|x| x.as_u64()) {
+            b.chars_per_token = v;
+        }
+        if let Some(v) = body.get("empty_transcript").and_then(|x| x.as_bool()) {
+            b.empty_transcript = v;
+        }
+        if let Some(v) = body.get("llamaswap").and_then(|x| x.as_bool()) {
+            b.llamaswap = v;
+        }
     }
 
-    pub fn models_snapshot(&self) -> Vec<String> {
+    pub fn llamaswap_enabled(&self) -> bool {
+        self.behavior.lock().unwrap().llamaswap
+    }
+
+    pub fn models_snapshot(&self) -> Vec<Value> {
         self.models.lock().unwrap().clone()
     }
 
-    // accept ["a","b"] or {"models":["a","b"]}; ignore anything else.
+    // accept ["a","b"], [{"id":"a", ...}], or {"models":[...]}; ignore anything
+    // else. entries are normalized to full model objects so a caller can mirror
+    // a real server's metadata verbatim.
     pub fn set_models(&self, body: &Value) {
         let list = match body {
             Value::Array(a) => a,
@@ -157,9 +211,6 @@ impl State {
                 None => return,
             },
         };
-        *self.models.lock().unwrap() = list
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
+        *self.models.lock().unwrap() = list.iter().filter_map(normalize_model).collect();
     }
 }

@@ -23,18 +23,35 @@ impl Handler for Models {
 
     fn handle(&self, state: &Shared, req: &ParsedRequest) -> HttpResponse {
         let path = req.path.split('?').next().unwrap_or(&req.path);
-        let ids = state.models_snapshot();
+        let models = state.models_snapshot();
         if let Some(id) = path.strip_prefix(&format!("{MODELS_PATH}/")) {
-            if ids.iter().any(|m| m == id) {
-                return HttpResponse::json(200, &model_obj(id));
+            // with llamaswap on, an advertised alias also resolves to the model
+            // behind it, mirroring a gateway that accepts either name.
+            let aliases = state.llamaswap_enabled();
+            if let Some(model) = models
+                .iter()
+                .find(|m| model_names(m, aliases).any(|n| n == id))
+            {
+                return HttpResponse::json(200, model);
             }
             return HttpResponse::json(404, &json!({"error": format!("model not found: {id}")}));
         }
-        let data: Vec<Value> = ids.iter().map(|id| model_obj(id)).collect();
-        HttpResponse::json(200, &json!({"object": "list", "data": data}))
+        HttpResponse::json(200, &json!({"object": "list", "data": models}))
     }
 }
 
-fn model_obj(id: &str) -> Value {
-    json!({"id": id, "object": "model", "created": 0, "owned_by": "fake-openai"})
+// every name a model answers to: its id, plus any advertised llama-swap aliases
+// when that extension is enabled.
+pub fn model_names(model: &Value, aliases: bool) -> impl Iterator<Item = &str> {
+    let id = model.get("id").and_then(|v| v.as_str());
+    let alias_list = match aliases {
+        true => model
+            .pointer("/meta/llamaswap/aliases")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]),
+        false => &[],
+    };
+    id.into_iter()
+        .chain(alias_list.iter().filter_map(|v| v.as_str()))
 }

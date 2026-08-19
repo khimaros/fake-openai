@@ -49,13 +49,55 @@ or set the provider `base_url` / `baseURL` in the harness config to the same val
 - `GET /v1/models/{id}` -- returns one model object, or 404 if unknown.
 - `POST /v1/audio/speech` -- text-to-speech. returns deterministic pcm: raw
   `audio/pcm` bytes, or `text/event-stream` `speech.audio.delta` frames when the
-  body sets `stream_format: "sse"`.
+  body sets `stream_format: "sse"`. both transports carry the SAME payload -- a
+  positional ramp (`i % 251`), not silence -- so a consumer can assert the audio
+  it received is the audio that was sent, in order and unshifted. the period is
+  coprime with the 2-byte s16_le sample width, so a stream that slipped by one
+  byte cannot coincidentally re-align.
 - `POST /v1/audio/transcriptions` -- speech-to-text. accepts a multipart upload
   and returns a fixed `{"text": ...}` transcript.
 - `GET /v1/audio/voices` -- lists a default voice for onboarding probes.
+- `POST /v1/audio/voices` -- voice cloning. accepts a multipart sample and
+  returns the created voice, named after the request's `name` field (default
+  `cloned-voice`), which a caller feeds back as the `voice` of a later speech
+  request.
+- `POST /v1/images/generations` -- returns a real 1x1 png, so a client that
+  decodes and writes the payload gets image bytes rather than a placeholder.
+  honors `n` and `response_format` (`b64_json` default, or a `data:` url).
 
 any other path returns 404 with an `endpoints` listing of what is served (so a
 bare `GET /v1` is a discovery aid, not a model list).
+
+## models and metadata
+
+`--models a,b` lists bare ids. `--models-json` (or `PUT /__admin/models`) takes
+full model objects, reported verbatim, so a caller can mirror what a real server
+advertises -- the standard openai fields are filled in where absent:
+
+```json
+[{"id": "qwen3.6-27b:Q8_0",
+  "meta": {"llamaswap": {"aliases": ["llm-1"], "modsi": "text,image", "modso": "text"}}}]
+```
+
+a client that filters a model picker by modality, or resolves a stable alias to
+whatever model currently sits behind it, needs this metadata to have anything to
+read. `clients/python/fakeopenai.py` has a `llamaswap_model()` builder for it.
+
+## llama-swap extensions
+
+`--llamaswap` (or behavior `llamaswap`, **default off**) serves the non-standard
+surface a llama-swap gateway adds:
+
+- `/upstream/<model>/v1/...` -- the per-model routes a client falls back to when
+  the plain path fails. the prefix is stripped and the request served by the same
+  handler, so both routes reach one implementation. with the extension off the
+  whole `/upstream/` namespace 404s.
+- `GET /v1/models/{id}` also resolves an advertised `meta.llamaswap.aliases`
+  entry to the model behind it.
+
+it is off by default so the mock answers as a plain openai-compatible server
+unless a caller opts in -- which lets one test prove a client works against a
+vanilla server and another prove its gateway fallback path works.
 
 ## programming responses
 
@@ -68,6 +110,7 @@ a response spec is either high-level (rendered to SSE or json):
 ```json
 {
   "content": "hello",
+  "reasoning": "let me think",
   "tool_calls": [],
   "finish_reason": "stop",
   "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
@@ -75,6 +118,13 @@ a response spec is either high-level (rendered to SSE or json):
   "delay_ms": 0
 }
 ```
+
+`reasoning` (optional) emits thinking output before the content: a `reasoning_content`
+delta first when streaming (the field openai-compatible endpoints like llama.cpp use),
+or a `reasoning_content` field on the message in the non-stream json. `reasoning_chunks`
+(a string array, like `chunks` for content) streams one reasoning delta per element,
+paced by `chunk_delay_ms`, so a client's incremental thinking render can be exercised;
+the non-stream json joins them.
 
 or raw (returned verbatim; `content_type` defaults to `text/event-stream`):
 
@@ -135,6 +185,22 @@ address instead.
 request missing a `model`, missing `messages`, or lacking a bearer Authorization
 header with an openai-style 400/401, before the queue is consumed.
 
+## context window
+
+`--context-window <n>` (or behavior `context_window`, default off) makes the
+reported `usage` track the request instead of the spec: the prompt tokens are
+derived from the serialized `messages` at `--chars-per-token` characters each
+(default 4, behavior `chars_per_token`), and a request whose derived prompt
+exceeds `n` is rejected with a `context_length_exceeded` 400 before the queue is
+consumed -- the same body llama-server returns at the wall.
+
+a fixed per-turn `usage` cannot test a harness that compacts its own context: the
+harness decides whether to compact from the usage a server reports, so a compacted
+(smaller) request must report a smaller usage, and only a derived usage does that.
+with this on, the mock closes that loop -- shrink the request and the reported
+usage shrinks, grow it past the window and it overflows. tune `--chars-per-token`
+to the content (dense code or base64 packs closer to two characters per token).
+
 ## admin api
 
 the `/__admin` namespace shares the port and is never itself captured.
@@ -154,7 +220,7 @@ the `/__admin` namespace shares the port and is never itself captured.
 | GET | /__admin/behavior | - | current stall/heartbeat config |
 | POST | /__admin/behavior | partial | merge config (e.g. `{"stall_first_with_tools": true}`) |
 | GET | /__admin/models | - | `{models: [...]}` |
-| PUT | /__admin/models | [id] or `{models:[id]}` | set the model list |
+| PUT | /__admin/models | [id], [object], or `{models:[...]}` | set the model list |
 
 ## capture log
 

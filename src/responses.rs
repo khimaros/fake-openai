@@ -24,6 +24,8 @@ pub struct ResponseSpec {
     raw_body: Option<String>,
     content_type: Option<String>,
     content: Option<String>,
+    reasoning: Option<String>,
+    reasoning_chunks: Option<Vec<String>>,
     chunks: Option<Vec<String>>,
     tool_calls: Option<Value>,
     error: Option<Value>,
@@ -34,7 +36,15 @@ pub struct ResponseSpec {
     chunk_delay_ms: u64,
     hang_ms: u64,
     truncate: bool,
+    // set at request time (not from the spec json) when the context-window
+    // behavior is on: overrides the reported prompt/total usage with a value
+    // derived from the actual request size.
+    derived_prompt: Option<u64>,
 }
+
+// completion tokens reported alongside a derived prompt when the spec carries no
+// usage of its own -- a small nonzero count so total_tokens stays realistic.
+const DERIVED_COMPLETION_TOKENS: u64 = 16;
 
 impl ResponseSpec {
     pub fn from_value(v: &Value) -> ResponseSpec {
@@ -42,6 +52,8 @@ impl ResponseSpec {
             raw_body: str_field(v, "raw_body"),
             content_type: str_field(v, "content_type"),
             content: str_field(v, "content"),
+            reasoning: str_field(v, "reasoning"),
+            reasoning_chunks: string_vec(v, "reasoning_chunks"),
             chunks: string_vec(v, "chunks"),
             tool_calls: v.get("tool_calls").cloned(),
             error: v.get("error").cloned(),
@@ -52,7 +64,16 @@ impl ResponseSpec {
             chunk_delay_ms: u64_field(v, "chunk_delay_ms"),
             hang_ms: u64_field(v, "hang_ms"),
             truncate: v.get("truncate").and_then(|x| x.as_bool()).unwrap_or(false),
+            derived_prompt: None,
         }
+    }
+
+    // override the reported prompt/total usage with a value derived from the
+    // request size (set by the context-window behavior), keeping any spec
+    // completion count. consumes and returns self so the handler can chain it.
+    pub fn with_derived_prompt(mut self, prompt_tokens: u64) -> ResponseSpec {
+        self.derived_prompt = Some(prompt_tokens);
+        self
     }
 
     pub fn to_value(&self) -> Value {
@@ -64,6 +85,12 @@ impl ResponseSpec {
             self.content_type.as_ref().map(|s| json!(s)),
         );
         insert_opt(&mut m, "content", self.content.as_ref().map(|s| json!(s)));
+        insert_opt(&mut m, "reasoning", self.reasoning.as_ref().map(|s| json!(s)));
+        insert_opt(
+            &mut m,
+            "reasoning_chunks",
+            self.reasoning_chunks.as_ref().map(|c| json!(c)),
+        );
         insert_opt(&mut m, "chunks", self.chunks.as_ref().map(|c| json!(c)));
         insert_opt(&mut m, "tool_calls", self.tool_calls.clone());
         insert_opt(&mut m, "error", self.error.clone());
@@ -127,6 +154,14 @@ impl ResponseSpec {
     fn render_sse(&self) -> HttpResponse {
         let pieces = self.content_pieces();
         let mut frames: Vec<Frame> = Vec::new();
+        // reasoning streams first (as `reasoning_content`, the field openai-compatible
+        // endpoints use), before the visible content. multiple `reasoning_chunks`
+        // stream one delta each (paced by chunk_delay_ms) to exercise incremental
+        // reasoning rendering, just like `chunks` does for content.
+        for (i, piece) in self.reasoning_pieces().iter().enumerate() {
+            let delay = if i == 0 { 0 } else { self.chunk_delay_ms };
+            frames.push(frame(delay, self.reasoning_chunk(piece)));
+        }
         // one content delta per piece; tool_calls and the leading role ride the
         // first delta. with no pieces, still emit a single role delta.
         if pieces.is_empty() {
@@ -161,6 +196,12 @@ impl ResponseSpec {
         let mut message = serde_json::Map::new();
         message.insert("role".to_string(), json!("assistant"));
         message.insert("content".to_string(), json!(self.content_pieces().concat()));
+        let reasoning = self.reasoning_pieces().concat();
+        insert_opt(
+            &mut message,
+            "reasoning_content",
+            (!reasoning.is_empty()).then(|| json!(reasoning)),
+        );
         insert_opt(&mut message, "tool_calls", self.tool_calls.clone());
         let body = json!({
             "id": "1", "object": "chat.completion", "created": 0, "model": DEFAULT_MODEL,
@@ -182,6 +223,18 @@ impl ResponseSpec {
         }
     }
 
+    // the reasoning delivered, split into streamed pieces: `reasoning_chunks` if
+    // given, else the single `reasoning`, else nothing. mirrors content_pieces.
+    fn reasoning_pieces(&self) -> Vec<String> {
+        if let Some(chunks) = &self.reasoning_chunks {
+            chunks.clone()
+        } else if let Some(r) = &self.reasoning {
+            vec![r.clone()]
+        } else {
+            vec![]
+        }
+    }
+
     // a streaming `data:` frame carrying one assistant delta.
     fn delta_chunk(&self, content: Option<&str>, tool_calls: Option<Value>) -> String {
         let mut delta = serde_json::Map::new();
@@ -193,6 +246,17 @@ impl ResponseSpec {
         let chunk = json!({
             "id": "1", "object": "chat.completion.chunk", "created": 0, "model": DEFAULT_MODEL,
             "choices": [{"index": 0, "delta": Value::Object(delta), "finish_reason": null}],
+        });
+        format!("data: {chunk}\n\n")
+    }
+
+    // a streaming `data:` frame carrying one reasoning delta (`reasoning_content`,
+    // which openai-compatible endpoints use for thinking output).
+    fn reasoning_chunk(&self, text: &str) -> String {
+        let delta = json!({ "role": "assistant", "reasoning_content": text });
+        let chunk = json!({
+            "id": "1", "object": "chat.completion.chunk", "created": 0, "model": DEFAULT_MODEL,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
         });
         format!("data: {chunk}\n\n")
     }
@@ -219,6 +283,19 @@ impl ResponseSpec {
     }
 
     fn usage(&self) -> Value {
+        if let Some(prompt) = self.derived_prompt {
+            let completion = self
+                .usage
+                .as_ref()
+                .and_then(|u| u.get("completion_tokens"))
+                .and_then(|c| c.as_u64())
+                .unwrap_or(DERIVED_COMPLETION_TOKENS);
+            return json!({
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": prompt + completion,
+            });
+        }
         self.usage.clone().unwrap_or_else(
             || json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}),
         )
