@@ -119,17 +119,24 @@ def set_models(admin_url, ids):
     _admin(admin_url, "/models", "PUT", list(ids))
 
 
-def llamaswap_model(model_id, aliases=(), modsi="text", modso="text"):
+def llamaswap_model(model_id, aliases=(), modsi="text", modso="text", voices=()):
     """build a /v1/models entry carrying llama-swap metadata.
 
     `aliases` are the stable names the model also answers to; `modsi`/`modso`
     are its comma-separated input/output modality tags, which clients read to
     filter a model picker down to the models a given task can use. serving the
     alias itself needs the llamaswap behavior enabled.
+
+    `voices` are the speaker presets baked into that model, comma-joined the way
+    the server publishes them. they belong to ONE model, so a server-wide voice
+    listing cannot stand in for them: offering another model's presets is a
+    wrong answer rather than a missing one.
     """
     meta = {"modsi": modsi, "modso": modso}
     if aliases:
         meta["aliases"] = list(aliases)
+    if voices:
+        meta["voices"] = ",".join(voices)
     return {"id": model_id, "meta": {"llamaswap": meta}}
 
 

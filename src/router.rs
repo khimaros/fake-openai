@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::admin::{self, ADMIN_PREFIX};
 use crate::capture;
 use crate::handlers::{
-    audio::{AudioSpeech, AudioTranscriptions, AudioVoices},
+    audio::{AudioSpeech, AudioTranscriptions, AudioVoices, VoiceRegistry},
     chat::ChatCompletions,
     images::ImagesGenerations,
     models::Models,
@@ -41,6 +41,7 @@ impl Router {
                 Box::new(AudioSpeech),
                 Box::new(AudioTranscriptions),
                 Box::new(AudioVoices),
+                Box::new(VoiceRegistry),
                 Box::new(ImagesGenerations),
                 Box::new(Models),
             ],
@@ -52,13 +53,24 @@ impl Router {
         if path.starts_with(ADMIN_PREFIX) {
             return admin::handle(state, req, &path);
         }
-        // connection-level latency: pay it before touching the request, so a
-        // client sees a slow first byte. admin (above) is exempt.
+        // RECORDED WHEN IT ARRIVES, NOT WHEN IT IS ANSWERED. the capture is a record of what the
+        // client ASKED, and the request did arrive now -- `connect_delay_ms` models how slowly this
+        // server answers, which is a fact about the response and has no business backdating the
+        // question.
+        //
+        // IT ALSO STOPPED THE LEDGER BEING A RACE. recording after the sleep made every request
+        // invisible to /__admin/captures for the whole delay, so a harness that acts and then counts
+        // captures was racing an artificial timer. measured in hmux's audio bench at a 5000ms delay:
+        // it read `0 of 6` blocks synthesized for a turn this server had already been asked to
+        // synthesize four times, and the same check passed or failed run to run on identical client
+        // code depending on how long the scenario happened to wait afterwards.
+        capture::record(state, req);
+        // connection-level latency: pay it before any response bytes, so a client
+        // sees a slow first byte. admin (above) is exempt.
         let connect_delay = state.behavior.lock().unwrap().connect_delay_ms;
         if connect_delay > 0 {
             thread::sleep(Duration::from_millis(connect_delay));
         }
-        capture::record(state, req);
         // llama-swap fronts each model at /upstream/<model>/v1/..., which clients
         // fall back to when the plain path fails. strip the prefix and serve it
         // with the same handlers, so both routes reach one implementation. with

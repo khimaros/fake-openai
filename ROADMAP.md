@@ -60,6 +60,10 @@ mock can prove a client works against a plain openai server.
 - [x] `POST /v1/images/generations` returning a real decodable png, honoring `n`
   and `response_format`
 - [x] `POST /v1/audio/voices` voice cloning, echoing the requested voice name
+- [x] `GET/POST /v1/voices` registry enrolment behind a `consent_attestation`
+  gate, so a client can be proven against the crispasr shape too
+- [x] the registry remembers what it stored: a duplicate name is 409 until
+  `?force=true`, so a re-run's failure is reachable from a test
 - [x] model objects carry caller-supplied metadata verbatim (`--models-json`,
   `PUT /__admin/models`), so modality tags and aliases are readable
 - [x] opt-in `llamaswap` behavior (default off): `/upstream/<model>/v1/*` routes
@@ -108,3 +112,22 @@ to silently mask broken wiring).
 - [ ] request matching / stubbing by body (wiremock-style), beyond the
   sequential queue
 - [ ] web ui built on the admin api
+
+## v0.7: prove the audio was real
+
+- [x] measure the audio a transcription request carries, and expose it in the
+      capture as `audio: {bytes, samples, peak, rms}`. the handler currently
+      ignores the request entirely (`_req`) and answers a fixed transcript, so a
+      caller that commits pure SILENCE gets a transcript, a reply, and a green
+      test. that cost a downstream harness months: its emulator's microphone was
+      delivering zeros the whole time and every spoken scenario still passed.
+- [x] `--reject-silent-audio`, off by default: answer a transcription request
+      whose audio is silent with an openai-style 400 instead of a transcript, so
+      the failure lands at the moment it happens rather than three layers later.
+      off by default because every existing consumer relies on the fixed
+      transcript, and requirement 5 must not regress.
+- [x] `--require-voice-consent`, off by default: gate `/v1/audio/speech` on a
+      `consent_attestation` when the voice is not the preset, so a client that
+      attests only at enrolment fails here rather than on its second real call.
+      off by default because it is a crispasr extension, not openai.
+

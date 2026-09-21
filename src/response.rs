@@ -31,6 +31,11 @@ pub struct ParsedRequest {
     pub path: String,
     pub headers: Value,
     pub body: Value,
+    // THE BYTES AS RECEIVED. `body` is lossy for anything that is not utf8 -- audio arrives as
+    // binary and every invalid sample becomes U+FFFD -- so a consumer that needs to MEASURE what
+    // was sent cannot use it. kept alongside rather than replacing it: `body` is the captured
+    // contract and must not change shape.
+    pub raw: Vec<u8>,
 }
 
 pub fn parse_request(req: &mut Request) -> ParsedRequest {
@@ -52,6 +57,7 @@ pub fn parse_request(req: &mut Request) -> ParsedRequest {
         path,
         headers: Value::Object(headers),
         body,
+        raw: buf,
     }
 }
 

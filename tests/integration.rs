@@ -27,6 +27,9 @@ const CHAT_PATH: &str = "/v1/chat/completions";
 const SPEECH_PATH: &str = "/v1/audio/speech";
 const TRANSCRIPTIONS_PATH: &str = "/v1/audio/transcriptions";
 const VOICES_PATH: &str = "/v1/audio/voices";
+const REGISTRY_VOICES_PATH: &str = "/v1/voices";
+const FLAG_REQUIRE_VOICE_CONSENT: &str = "--require-voice-consent";
+const DEFAULT_VOICE: &str = "alloy";
 const IMAGES_PATH: &str = "/v1/images/generations";
 
 // a streaming chat request body, optionally tools-bearing and/or a heartbeat.
@@ -140,6 +143,39 @@ impl Server {
 
     fn post(&self, path: &str, body: &str) -> (u16, String) {
         self.req("POST", path, body)
+    }
+
+    // POST a body that is BYTES. audio is binary; building it as a string first mangles every
+    // non-utf8 sample, which is the very thing the audio measurement has to see through.
+    fn post_bytes(&self, path: &str, body: &[u8]) -> (u16, String) {
+        let mut stream = TcpStream::connect(&self.addr).expect("connect");
+        stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: multipart/form-data; \
+             boundary=b\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            self.addr,
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        stream.flush().unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).unwrap();
+        let split = resp
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("header terminator");
+        let headers = String::from_utf8_lossy(&resp[..split]).into_owned();
+        let status = headers
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        (status, String::from_utf8_lossy(&resp[split + 4..]).into_owned())
     }
 
     fn get(&self, path: &str) -> (u16, String) {
@@ -639,6 +675,140 @@ fn audio_voices_list() {
     assert!(body.contains("alloy"), "{body}");
 }
 
+#[test]
+fn tts_speech_sse_can_be_paced_so_a_reply_arrives_over_time() {
+    // A REPLY THAT ARRIVES INSTANTLY CANNOT STARVE A CLIENT, and the default answers the whole
+    // thing in one write. that is the right default -- fast and deterministic -- but it makes one
+    // real behaviour unreachable: a jitter buffer that gates only the START of a reply is correct
+    // for every reply that is already in hand before the first sample plays. the middle of a real
+    // reply arrives over a link, and pacing is what lets a bench ask about it.
+    let s = Server::spawn(&[]);
+    let body = "{\"input\":\"hi\",\"model\":\"tts-1\",\"voice\":\"alloy\",\
+                \"response_format\":\"pcm\",\"stream_format\":\"sse\"}";
+
+    let at = Instant::now();
+    let (status, _, unpaced) = s.req_full("POST", SPEECH_PATH, body);
+    let quick = at.elapsed();
+    assert_eq!(status, 200);
+
+    let (status, _) = s.post("/__admin/behavior", "{\"speech_frame_delay_ms\":250}");
+    assert_eq!(status, 200);
+    let at = Instant::now();
+    let (status, head, paced) = s.req_full("POST", SPEECH_PATH, body);
+    let slow = at.elapsed();
+
+    assert_eq!(status, 200);
+    assert!(
+        head.to_lowercase()
+            .contains("content-type: text/event-stream"),
+        "{head}"
+    );
+    assert!(
+        slow >= Duration::from_millis(400),
+        "the frames were not held apart: paced took {slow:?}, unpaced {quick:?}"
+    );
+    // SAME STREAM, JUST SLOWER. pacing that changed the audio would make every measurement taken
+    // through it a measurement of the mock. compared by DATA LINE rather than by raw body: a
+    // paced response is chunked transfer, so its bytes carry frame sizes the buffered one has not.
+    let audio = |s: &str| {
+        s.lines()
+            .filter(|l| l.starts_with("data: {\"audio\""))
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        audio(&paced),
+        audio(&unpaced),
+        "a paced reply must carry the same audio as an unpaced one"
+    );
+    assert!(!audio(&paced).is_empty(), "no audio at all: {paced}");
+    assert!(
+        paced.contains("[DONE]"),
+        "a paced stream must still terminate: {paced}"
+    );
+}
+
+// write a raw pcm fixture whose bytes name it, so a test can tell WHICH one came back.
+fn pcm_fixture(name: &str, fill: u8) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("fake-openai-{name}-{fill}.pcm"));
+    std::fs::write(&path, vec![fill; 64]).expect("write fixture");
+    path
+}
+
+// ONE FIXTURE FOR EVERY UTTERANCE MAKES A MULTI-BLOCK TURN UNREADABLE. an agent that speaks three
+// times over one turn plays the same clip three times, and nothing in a recording of it
+// distinguishes "said something new" from "replayed the last thing". the fixture is chosen by the
+// TEXT so the choice is deterministic and order-independent -- a round-robin would re-voice the
+// whole scenario the moment one extra sentence appeared anywhere ahead of it.
+#[test]
+fn tts_serves_the_fixture_that_matches_the_text() {
+    let first = pcm_fixture("first", 0x11);
+    let second = pcm_fixture("second", 0x22);
+    let fallback = pcm_fixture("fallback", 0x33);
+    let s = Server::spawn(&[
+        "--speech-for",
+        &format!("checking={}", first.display()),
+        "--speech-for",
+        &format!("almost there={}", second.display()),
+        "--speech-file",
+        &fallback.display().to_string(),
+    ]);
+    let say = |text: &str| {
+        let body = format!("{{\"input\":\"{text}\",\"response_format\":\"pcm\"}}");
+        let (status, _, pcm) = s.req_bytes("POST", SPEECH_PATH, &body);
+        assert_eq!(status, 200);
+        pcm
+    };
+    assert_eq!(say("Checking.")[0], 0x11, "the first fixture");
+    assert_eq!(say("Almost there.")[0], 0x22, "the second");
+    // ORDER MUST NOT MATTER: asking again gives the same voice, not the next one in a rotation.
+    assert_eq!(say("Checking.")[0], 0x11, "the same text is the same audio");
+    // matching is case-insensitive, because the text comes from a model and its casing is not a
+    // contract. anything unmatched falls back to --speech-file rather than to silence.
+    assert_eq!(say("CHECKING, one moment.")[0], 0x11);
+    assert_eq!(say("something else entirely")[0], 0x33, "the fallback");
+
+    // and with no variants configured at all, --speech-file is still the whole answer.
+    let plain = Server::spawn(&["--speech-file", &fallback.display().to_string()]);
+    let (_, _, pcm) = plain.req_bytes(
+        "POST",
+        SPEECH_PATH,
+        "{\"input\":\"checking\",\"response_format\":\"pcm\"}",
+    );
+    assert_eq!(pcm[0], 0x33);
+}
+
+// A SCENARIO IS A CONVERSATION. a harness that plays two different utterances into a microphone
+// and is told the same words both times cannot script a flow at all -- and a recording of the
+// exchange, where the transcript is what the agent answers, becomes nonsense to listen to.
+#[test]
+fn stt_transcript_is_configurable_and_settable_at_runtime() {
+    let s = Server::spawn(&["--transcript", "the build is failing again"]);
+    let (status, body) = s.post(TRANSCRIPTIONS_PATH, "blob");
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["text"], "the build is failing again");
+
+    // the next utterance is a different one, and the mock has to be able to say so mid-run.
+    let (status, _) = s.post("/__admin/behavior", "{\"transcript\":\"thanks, that worked\"}");
+    assert_eq!(status, 200);
+    let (_, body) = s.post(TRANSCRIPTIONS_PATH, "blob");
+    assert_eq!(json(&body)["text"], "thanks, that worked");
+
+    // an explicit null goes back to the built-in, so a scenario can hand the mock back unchanged.
+    s.post("/__admin/behavior", "{\"transcript\":null}");
+    let (_, body) = s.post(TRANSCRIPTIONS_PATH, "blob");
+    assert_eq!(json(&body)["text"], "this is a test transcription");
+
+    // an empty clip is still an empty transcript, whatever text is configured: what the
+    // transcriber HEARD wins over what it would have said.
+    s.post(
+        "/__admin/behavior",
+        "{\"transcript\":\"hello\",\"empty_transcript\":true}",
+    );
+    let (_, body) = s.post(TRANSCRIPTIONS_PATH, "blob");
+    assert_eq!(json(&body)["text"], "");
+}
+
 // a transcriber that hears no speech returns an EMPTY string, not an error. consumers get this
 // wrong (hmux's voice face said nothing back and wedged its client in "transcribing"), so the
 // mock has to be able to produce it.
@@ -839,6 +1009,54 @@ fn connect_delay_applies_to_requests_not_admin() {
         "no connect delay: {:?}",
         start.elapsed()
     );
+}
+
+/// THE LEDGER MUST NOT LAG THE TRAFFIC. a capture records what the client ASKED, so it is written
+/// when the request arrives -- `connect_delay_ms` describes how slowly this server ANSWERS, and has
+/// no business backdating the question.
+///
+/// recording it after the sleep made every request invisible for the whole delay, which turns any
+/// "act, then count captures" harness into a race against an artificial timer. hmux's audio bench
+/// read `0 of 6` blocks synthesized for a turn this server had already been asked to synthesize
+/// four times, and the same check passed or failed between runs of identical client code.
+#[test]
+fn a_capture_is_recorded_before_the_connect_delay_is_paid() {
+    let s = Server::spawn(&["--connect-delay-ms", "1500"]);
+    let addr = s.addr.clone();
+    let body = chat_body(false, false, true);
+    // this request cannot answer for 1500ms, so it is still in flight for the whole assertion.
+    let caller = std::thread::spawn(move || {
+        let mut stream = TcpStream::connect(&addr).expect("connect");
+        stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+        let head = format!(
+            "POST {CHAT_PATH} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(body.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        let mut resp = Vec::new();
+        let _ = stream.read_to_end(&mut resp);
+    });
+    // WELL INSIDE THE DELAY: late enough that the request has certainly been read, early enough
+    // that no response can have been sent -- so a capture found here was written on arrival.
+    std::thread::sleep(Duration::from_millis(400));
+    let seen = s.captures();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the request is in flight and unrecorded -- the ledger is racing the connect delay: {seen:?}"
+    );
+    assert_eq!(seen[0]["path"], CHAT_PATH);
+    // and it is stamped, so a consumer can correlate against its own log rather than infer from
+    // order alone.
+    assert!(
+        seen[0]["at_ms"].as_u64().unwrap_or(0) > 0,
+        "capture carries no at_ms: {:?}",
+        seen[0]
+    );
+    caller.join().expect("caller thread");
 }
 
 #[test]
@@ -1132,6 +1350,121 @@ fn voice_clone_falls_back_to_a_default_name() {
     assert_eq!(json(&resp)["id"], "cloned-voice");
 }
 
+#[test]
+fn speech_with_a_cloned_voice_is_gated_on_consent() {
+    // ENROLMENT IS NOT THE ONLY GATE. crispasr also refuses to SPEAK as a cloned
+    // voice without an attestation, and a client that only sends the field at
+    // upload time passes the first gate and fails the second.
+    let s = Server::spawn(&[FLAG_REQUIRE_VOICE_CONSENT]);
+    let (status, body) = s.post(SPEECH_PATH, r#"{"input":"hi","voice":"narrator"}"#);
+    assert_eq!(status, 400);
+    assert_eq!(json(&body)["error"]["code"], "consent_required");
+}
+
+#[test]
+fn speech_with_a_cloned_voice_passes_with_consent() {
+    let s = Server::spawn(&[FLAG_REQUIRE_VOICE_CONSENT]);
+    let body = r#"{"input":"hi","voice":"narrator","consent_attestation":"i hold the rights"}"#;
+    let (status, _) = s.post(SPEECH_PATH, body);
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn speech_with_a_preset_voice_is_never_gated() {
+    // the gate is about CLONES. a preset is nobody's likeness, so requiring an
+    // attestation for one would make the mock reject requests a real server takes.
+    let s = Server::spawn(&[FLAG_REQUIRE_VOICE_CONSENT]);
+    let body = format!(r#"{{"input":"hi","voice":"{DEFAULT_VOICE}"}}"#);
+    assert_eq!(s.post(SPEECH_PATH, &body).0, 200);
+    assert_eq!(s.post(SPEECH_PATH, r#"{"input":"hi"}"#).0, 200);
+}
+
+#[test]
+fn speech_consent_gate_is_off_by_default() {
+    // it is a crispasr extension, not openai. left on by default the mock would
+    // reject plain openai traffic that every other consumer here sends.
+    let s = Server::spawn(&[]);
+    assert_eq!(s.post(SPEECH_PATH, r#"{"input":"hi","voice":"narrator"}"#).0, 200);
+}
+
+#[test]
+fn voice_registry_lists_voices() {
+    let s = Server::spawn(&[]);
+    let (status, body) = s.get(REGISTRY_VOICES_PATH);
+    assert_eq!(status, 200);
+    assert!(body.contains("alloy"), "{body}");
+}
+
+// a well-formed enrolment for `name`, attestation included.
+fn voice_upload_body(name: &str) -> String {
+    format!(
+        "--X\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\n{name}\r\n\
+         --X\r\nContent-Disposition: form-data; name=\"consent_attestation\"\r\n\r\ni hold the rights\r\n\
+         --X\r\nContent-Disposition: form-data; name=\"voice\"; filename=\"a.wav\"\r\n\r\n\
+         RIFFdata\r\n--X--\r\n"
+    )
+}
+
+#[test]
+fn voice_registry_upload_returns_the_stored_voice() {
+    // crispasr-style servers enrol a clone under POST /v1/voices and answer 201
+    // describing the STORED FILE, not the openai-shaped voice object the
+    // /v1/audio/voices path returns. a client that assumes one shape on both
+    // paths reads a null id off the other, so the mock keeps them distinct.
+    let s = Server::spawn(&[]);
+    let (status, resp) = s.post(REGISTRY_VOICES_PATH, &voice_upload_body("narrator"));
+    assert_eq!(status, 201);
+    assert_eq!(json(&resp)["name"], "narrator");
+    assert_eq!(json(&resp)["format"], "wav");
+}
+
+#[test]
+fn voice_registry_rejects_a_duplicate_name() {
+    // THE REGISTRY REMEMBERS. a stateless mock answers 201 forever and hides the
+    // one failure a workflow re-run actually hits: the name it chose last time
+    // is still taken. the reply names `force` because the client has to find it.
+    let s = Server::spawn(&[]);
+    assert_eq!(s.post(REGISTRY_VOICES_PATH, &voice_upload_body("narrator")).0, 201);
+    let (status, resp) = s.post(REGISTRY_VOICES_PATH, &voice_upload_body("narrator"));
+    assert_eq!(status, 409);
+    assert!(resp.contains("force"), "{resp}");
+}
+
+#[test]
+fn voice_registry_force_overwrites_an_existing_voice() {
+    let s = Server::spawn(&[]);
+    assert_eq!(s.post(REGISTRY_VOICES_PATH, &voice_upload_body("narrator")).0, 201);
+    let path = format!("{REGISTRY_VOICES_PATH}?force=true");
+    let (status, resp) = s.post(&path, &voice_upload_body("narrator"));
+    assert_eq!(status, 201);
+    assert_eq!(json(&resp)["name"], "narrator");
+}
+
+#[test]
+fn voice_registry_lists_what_was_enrolled() {
+    let s = Server::spawn(&[]);
+    s.post(REGISTRY_VOICES_PATH, &voice_upload_body("narrator"));
+    let (status, body) = s.get(REGISTRY_VOICES_PATH);
+    assert_eq!(status, 200);
+    assert!(body.contains("narrator"), "{body}");
+    assert!(body.contains(DEFAULT_VOICE), "{body}");
+}
+
+#[test]
+fn voice_registry_upload_requires_consent() {
+    // THE ATTESTATION IS THE GATE. a client that forgets the field must fail
+    // here, where the test names the reason, rather than against a real server.
+    let s = Server::spawn(&[]);
+    let body = concat!(
+        "--X\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nnarrator\r\n",
+        "--X\r\nContent-Disposition: form-data; name=\"voice\"; filename=\"a.wav\"\r\n\r\n",
+        "RIFFdata\r\n--X--\r\n",
+    );
+    let (status, resp) = s.post(REGISTRY_VOICES_PATH, body);
+    assert_eq!(status, 400);
+    assert_eq!(json(&resp)["code"], "consent_required");
+}
+
 // standard base64 decode, to prove the served image is real png bytes.
 fn b64_decode(s: &str) -> Vec<u8> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1149,3 +1482,106 @@ fn b64_decode(s: &str) -> Vec<u8> {
     }
     out
 }
+
+// --- v0.7: prove the audio was real -------------------------------------------------
+
+// a multipart body carrying `bytes` as the `file` field, shaped like the real client's.
+fn multipart_audio(bytes: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n\
+--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\
+Content-Type: audio/wav\r\n\r\n",
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n--b--\r\n");
+    body
+}
+
+// s16_le samples as bytes: `n` frames of `amplitude`, alternating sign so it is not dc.
+fn pcm(n: usize, amplitude: i16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let v = if i % 2 == 0 { amplitude } else { -amplitude };
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+#[test]
+fn transcription_captures_measure_the_audio() {
+    // THE DEFECT THIS CLOSES. the handler ignored the request entirely and answered a fixed
+    // transcript, so a caller that committed pure silence got a transcript and a green test.
+    // a downstream harness lost months to exactly that: its emulator microphone delivered zeros
+    // and every spoken scenario still passed.
+    let s = Server::spawn(&[]);
+    s.post_bytes(TRANSCRIPTIONS_PATH, &multipart_audio(&pcm(512, 9000)));
+    let caps = s.captures();
+    let audio = caps
+        .iter()
+        .find(|c| c["path"].as_str() == Some(TRANSCRIPTIONS_PATH))
+        .map(|c| c["audio"].clone())
+        .expect("a transcription capture");
+    assert!(audio.is_object(), "no audio measurement: {audio}");
+    assert!(audio["samples"].as_u64().unwrap_or(0) > 0, "no samples: {audio}");
+    assert!(audio["peak"].as_u64().unwrap_or(0) > 1000, "not loud: {audio}");
+    assert_eq!(audio["silent"].as_bool(), Some(false), "loud audio read as silent");
+}
+
+#[test]
+fn silence_is_reported_as_silent() {
+    let s = Server::spawn(&[]);
+    s.post_bytes(TRANSCRIPTIONS_PATH, &multipart_audio(&pcm(512, 0)));
+    let caps = s.captures();
+    let audio = caps
+        .iter()
+        .find(|c| c["path"].as_str() == Some(TRANSCRIPTIONS_PATH))
+        .map(|c| c["audio"].clone())
+        .expect("a transcription capture");
+    assert_eq!(audio["silent"].as_bool(), Some(true), "silence read as sound: {audio}");
+    assert_eq!(audio["peak"].as_u64(), Some(0), "silence has a peak: {audio}");
+}
+
+#[test]
+fn silence_still_transcribes_by_default() {
+    // REQUIREMENT 5 MUST NOT REGRESS: every existing consumer relies on the fixed transcript,
+    // so measuring the audio changes what is REPORTED, never what is answered.
+    let s = Server::spawn(&[]);
+    let (status, body) = s.post_bytes(TRANSCRIPTIONS_PATH, &multipart_audio(&pcm(512, 0)));
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["text"], "this is a test transcription");
+}
+
+#[test]
+fn reject_silent_audio_refuses_silence() {
+    let s = Server::spawn(&["--reject-silent-audio"]);
+    let (status, body) = s.post_bytes(TRANSCRIPTIONS_PATH, &multipart_audio(&pcm(512, 0)));
+    assert_eq!(status, 400, "silence was accepted: {body}");
+    assert!(
+        json(&body)["error"]["message"].as_str().unwrap_or("").contains("silent"),
+        "the error does not say why: {body}"
+    );
+}
+
+#[test]
+fn reject_silent_audio_still_accepts_speech() {
+    let s = Server::spawn(&["--reject-silent-audio"]);
+    let (status, body) = s.post_bytes(TRANSCRIPTIONS_PATH, &multipart_audio(&pcm(512, 9000)));
+    assert_eq!(status, 200, "real audio was rejected: {body}");
+    assert_eq!(json(&body)["text"], "this is a test transcription");
+}
+
+#[test]
+fn a_body_with_no_audio_is_not_measured() {
+    // the older tests post the string "blob"; that carries no file field and must stay working.
+    let s = Server::spawn(&[]);
+    let (status, _) = s.post(TRANSCRIPTIONS_PATH, "blob");
+    assert_eq!(status, 200);
+    let caps = s.captures();
+    let cap = caps
+        .iter()
+        .find(|c| c["path"].as_str() == Some(TRANSCRIPTIONS_PATH))
+        .expect("a capture");
+    assert!(cap["audio"].is_null(), "measured audio that was not there: {cap}");
+}
+

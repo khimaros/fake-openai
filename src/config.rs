@@ -28,11 +28,15 @@ const FLAG_HEARTBEAT: &str = "--heartbeat-sentinel";
 const FLAG_CONSUME_TOOLS: &str = "--consume-only-with-tools";
 const FLAG_CONNECT_DELAY: &str = "--connect-delay-ms";
 const FLAG_VALIDATE_CHAT: &str = "--validate-chat";
+const FLAG_REJECT_SILENT_AUDIO: &str = "--reject-silent-audio";
+const FLAG_REQUIRE_VOICE_CONSENT: &str = "--require-voice-consent";
 const FLAG_CONTEXT_WINDOW: &str = "--context-window";
 const FLAG_CHARS_PER_TOKEN: &str = "--chars-per-token";
 const FLAG_LLAMASWAP: &str = "--llamaswap";
 const FLAG_EMPTY_TRANSCRIPT: &str = "--empty-transcript";
 const FLAG_SPEECH_FILE: &str = "--speech-file";
+const FLAG_SPEECH_FOR: &str = "--speech-for";
+const FLAG_TRANSCRIPT: &str = "--transcript";
 
 pub struct Config {
     pub host: String,
@@ -53,6 +57,15 @@ pub struct Config {
     /// audio path -- jitter buffer, resampler, playout -- needs speech, end to end, with nothing
     /// injected into the client. Point this at a fixture for that.
     pub speech_file: Option<PathBuf>,
+    /// Fixtures chosen by what the request asks to be SAID: `(match, path)`, first match wins,
+    /// falling back to `speech_file` and then the ramp.
+    ///
+    /// One fixture for every utterance makes a recording of a multi-block turn unreadable -- the
+    /// agent says the same sentence four times, and nothing in the audio distinguishes "spoke
+    /// again" from "played the same clip again". Matching on the text keeps it DETERMINISTIC and
+    /// order-independent: a round-robin would make each line depend on how many requests happened
+    /// to precede it, so one extra sentence anywhere would re-voice the whole scenario.
+    pub speech_for: Vec<(String, PathBuf)>,
 }
 
 impl Default for Config {
@@ -66,6 +79,7 @@ impl Default for Config {
             log_file: None,
             log_stdout: false,
             speech_file: None,
+            speech_for: Vec::new(),
             models: parse_models(DEFAULT_MODEL),
             behavior: Behavior::default(),
         }
@@ -120,6 +134,8 @@ pub fn parse_args(args: Vec<String>) -> Result<Config, String> {
                 )?
             }
             FLAG_VALIDATE_CHAT => c.behavior.validate_chat = true,
+            FLAG_REJECT_SILENT_AUDIO => c.behavior.reject_silent_audio = true,
+            FLAG_REQUIRE_VOICE_CONSENT => c.behavior.require_voice_consent = true,
             FLAG_CONTEXT_WINDOW => {
                 c.behavior.context_window = Some(parse_num(
                     &take(&mut it, inline, FLAG_CONTEXT_WINDOW)?,
@@ -136,6 +152,19 @@ pub fn parse_args(args: Vec<String>) -> Result<Config, String> {
             FLAG_EMPTY_TRANSCRIPT => c.behavior.empty_transcript = true,
             FLAG_SPEECH_FILE => {
                 c.speech_file = Some(take(&mut it, inline, FLAG_SPEECH_FILE)?.into())
+            }
+            FLAG_SPEECH_FOR => {
+                let raw = take(&mut it, inline, FLAG_SPEECH_FOR)?;
+                let (m, path) = raw
+                    .split_once('=')
+                    .ok_or_else(|| format!("{FLAG_SPEECH_FOR}: expected <match>=<path>"))?;
+                if m.is_empty() {
+                    return Err(format!("{FLAG_SPEECH_FOR}: the match may not be empty"));
+                }
+                c.speech_for.push((m.to_lowercase(), path.into()));
+            }
+            FLAG_TRANSCRIPT => {
+                c.behavior.transcript = Some(take(&mut it, inline, FLAG_TRANSCRIPT)?)
             }
             other => return Err(format!("unknown flag: {other}")),
         }
@@ -218,6 +247,7 @@ pub fn usage() -> String {
     u.push_str("  --consume-only-with-tools only tools-bearing chat requests pop the queue\n");
     u.push_str("  --connect-delay-ms <n>    delay every non-admin request before any bytes\n");
     u.push_str("  --validate-chat           reject malformed/unauthenticated chat requests\n");
+    u.push_str("  --reject-silent-audio     reject transcriptions whose audio is silent\n");
     u.push_str(
         "  --context-window <n>      derive usage from request size; 400 when it exceeds n\n",
     );
@@ -233,6 +263,14 @@ pub fn usage() -> String {
     u.push_str(
         "  --speech-file <path>      /v1/audio/speech serves this wav/pcm instead of the ramp,\n\
          \x20                         so a client receives real SPEECH over the real path\n",
+    );
+    u.push_str(
+        "  --speech-for <m>=<path>   serve this fixture when the text to speak contains <m>\n\
+         \x20                         (repeatable, first match wins, falls back to --speech-file)\n",
+    );
+    u.push_str(
+        "  --transcript <text>       what transcriptions answer with (also settable at runtime\n\
+         \x20                         via the admin api, so a scenario can script a conversation)\n",
     );
     u.push_str("  --help                    show this help\n\n");
     u.push_str("on startup prints: base_url=http://<host>:<port>/v1\n");

@@ -25,6 +25,18 @@ pub struct Behavior {
     // when set, malformed or unauthenticated chat requests are rejected with an
     // openai-style 400/401 instead of being answered permissively.
     pub validate_chat: bool,
+    // when set, a transcription request whose audio is silent is rejected instead of answered
+    // with the fixed transcript. off by default: every existing consumer relies on that
+    // transcript, and a stub that answers anything is only a problem for a caller that wants to
+    // prove its capture path works.
+    pub reject_silent_audio: bool,
+    // when set, speaking as a voice other than the preset is rejected unless the
+    // request carries a `consent_attestation`, the way crispasr-style servers gate
+    // cloned-voice synthesis. ENROLMENT IS NOT THE ONLY GATE there, and a client
+    // that sends the field only at upload time clears the first and fails this
+    // one. off by default: it is a vendor extension a plain openai client never
+    // sends, and leaving it on would reject the traffic every other test here has.
+    pub require_voice_consent: bool,
     // when set, the reported usage is derived from the request size and a request
     // whose derived prompt exceeds this window is rejected with a context-overflow
     // 400. this closes the feedback loop a harness's compaction depends on: a
@@ -37,10 +49,25 @@ pub struct Behavior {
     // an advertised meta.llamaswap alias. off by default so the mock answers as
     // a plain openai-compatible server unless a caller opts in.
     pub llamaswap: bool,
+    // how long to hold between speech.audio.delta frames, in ms. 0 (the default) answers the whole
+    // reply in one write, which is the fast, deterministic thing a bench usually wants.
+    //
+    // A REPLY THAT ARRIVES INSTANTLY CANNOT STARVE A CLIENT, and starving one is a behaviour worth
+    // testing: the middle of a real reply arrives over a link, and a jitter buffer that only ever
+    // gates the START of one dribbles the rest out in fragment-sized bursts. that defect is
+    // unreachable from a mock that has already sent everything before the first sample is played.
+    pub speech_frame_delay_ms: u64,
     // when set, transcriptions answer with an EMPTY transcript. a real transcriber does this
     // whenever it hears no speech (whisper's vad filtering a silent clip), and it is not an
     // error -- so a consumer that only handles "text" or "failure" hangs on it.
     pub empty_transcript: bool,
+    // what transcriptions answer with; None keeps the built-in fixed string.
+    //
+    // SETTABLE AT RUNTIME because a scenario is a CONVERSATION: a harness that plays two different
+    // utterances into a microphone and gets the same words back for both cannot script a flow, and
+    // a mock that transcribes speech into something unrelated to it makes every recording of the
+    // exchange nonsense to listen to.
+    pub transcript: Option<String>,
 }
 
 impl Default for Behavior {
@@ -52,10 +79,14 @@ impl Default for Behavior {
             consume_only_with_tools: false,
             connect_delay_ms: 0,
             validate_chat: false,
+            reject_silent_audio: false,
+            require_voice_consent: false,
             context_window: None,
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
             llamaswap: false,
             empty_transcript: false,
+            speech_frame_delay_ms: 0,
+            transcript: None,
         }
     }
 }

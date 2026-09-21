@@ -1,7 +1,7 @@
 // shared server state. one mutex per concern, mirroring the single lock the
 // python mock used. cloned into each request thread as an Arc.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::sync::{Arc, Mutex};
 
@@ -21,11 +21,18 @@ pub struct State {
     pub behavior: Mutex<Behavior>,
     pub stalled_once: Mutex<bool>,
     pub models: Mutex<Vec<Value>>,
+    /// Names enrolled through `POST /v1/voices`. THE REGISTRY REMEMBERS, because
+    /// the one failure a re-run hits is that the name it picked last time is
+    /// still taken -- a stateless registry answers 201 forever and hides it.
+    /// Ordered so the listing is deterministic.
+    pub voices: Mutex<BTreeSet<String>>,
     pub log_file: Mutex<Option<File>>,
     pub log_stdout: bool,
     /// Raw s16le pcm served by `/v1/audio/speech` when `--speech-file` was given; None keeps the
     /// built-in positional ramp. Read once at boot so a request costs no io.
     pub speech_pcm: Option<Vec<u8>>,
+    /// `(lowercased match, pcm)` from `--speech-for`, in the order given. Also read at boot.
+    pub speech_variants: Vec<(String, Vec<u8>)>,
 }
 
 /// The samples of a wav, or the bytes as-is when they are already raw pcm.
@@ -51,6 +58,12 @@ fn raw_pcm(bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
+fn read_speech(p: &std::path::Path) -> Vec<u8> {
+    let bytes =
+        std::fs::read(p).unwrap_or_else(|e| panic!("read speech file {}: {e}", p.display()));
+    raw_pcm(bytes)
+}
+
 impl State {
     pub fn from_config(c: &Config) -> State {
         let log_file = c.log_file.as_ref().map(|p| {
@@ -67,14 +80,27 @@ impl State {
             behavior: Mutex::new(c.behavior.clone()),
             stalled_once: Mutex::new(false),
             models: Mutex::new(c.models.clone()),
+            voices: Mutex::new(BTreeSet::new()),
             log_file: Mutex::new(log_file),
             log_stdout: c.log_stdout,
-            speech_pcm: c.speech_file.as_ref().map(|p| {
-                let bytes = std::fs::read(p)
-                    .unwrap_or_else(|e| panic!("read speech file {}: {e}", p.display()));
-                raw_pcm(bytes)
-            }),
+            speech_pcm: c.speech_file.as_deref().map(read_speech),
+            speech_variants: c
+                .speech_for
+                .iter()
+                .map(|(m, p)| (m.clone(), read_speech(p)))
+                .collect(),
         }
+    }
+
+    /// The pcm for one speech request: the first `--speech-for` fixture whose match appears in the
+    /// text to be spoken, else `--speech-file`, else the built-in ramp (returned as None).
+    pub fn speech_for(&self, input: &str) -> Option<&[u8]> {
+        let input = input.to_lowercase();
+        self.speech_variants
+            .iter()
+            .find(|(m, _)| input.contains(m.as_str()))
+            .map(|(_, pcm)| pcm.as_slice())
+            .or(self.speech_pcm.as_deref())
     }
 
     // the configured fallback, cloned for use without holding the lock; None
@@ -97,7 +123,23 @@ impl State {
 
     pub fn reset(&self) {
         self.captures.lock().unwrap().clear();
+        self.voices.lock().unwrap().clear();
         *self.stalled_once.lock().unwrap() = false;
+    }
+
+    /// Enrol a voice, refusing a name already taken unless `force`. True when it
+    /// was stored.
+    pub fn enrol_voice(&self, name: &str, force: bool) -> bool {
+        let mut voices = self.voices.lock().unwrap();
+        if voices.contains(name) && !force {
+            return false;
+        }
+        voices.insert(name.to_string());
+        true
+    }
+
+    pub fn voice_names(&self) -> Vec<String> {
+        self.voices.lock().unwrap().iter().cloned().collect()
     }
 
     pub fn captures_snapshot(&self) -> Vec<Value> {
@@ -147,10 +189,14 @@ impl State {
             "consume_only_with_tools": b.consume_only_with_tools,
             "connect_delay_ms": b.connect_delay_ms,
             "validate_chat": b.validate_chat,
+            "reject_silent_audio": b.reject_silent_audio,
+            "require_voice_consent": b.require_voice_consent,
             "context_window": b.context_window,
             "chars_per_token": b.chars_per_token,
             "llamaswap": b.llamaswap,
             "empty_transcript": b.empty_transcript,
+            "speech_frame_delay_ms": b.speech_frame_delay_ms,
+            "transcript": b.transcript,
         })
     }
 
@@ -174,6 +220,12 @@ impl State {
         if let Some(v) = body.get("connect_delay_ms").and_then(|x| x.as_u64()) {
             b.connect_delay_ms = v;
         }
+        if let Some(v) = body.get("reject_silent_audio").and_then(|x| x.as_bool()) {
+            b.reject_silent_audio = v;
+        }
+        if let Some(v) = body.get("require_voice_consent").and_then(|x| x.as_bool()) {
+            b.require_voice_consent = v;
+        }
         if let Some(v) = body.get("validate_chat").and_then(|x| x.as_bool()) {
             b.validate_chat = v;
         }
@@ -189,6 +241,17 @@ impl State {
         }
         if let Some(v) = body.get("llamaswap").and_then(|x| x.as_bool()) {
             b.llamaswap = v;
+        }
+        if let Some(v) = body.get("speech_frame_delay_ms").and_then(|x| x.as_u64()) {
+            b.speech_frame_delay_ms = v;
+        }
+        // an explicit null restores the built-in fixed transcript; a string sets it.
+        if let Some(v) = body.get("transcript") {
+            b.transcript = if v.is_null() {
+                None
+            } else {
+                v.as_str().map(str::to_string)
+            };
         }
     }
 

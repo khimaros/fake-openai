@@ -2,6 +2,7 @@
 // agent harnesses. see README.md and DESIGN.md.
 
 mod admin;
+mod audio_probe;
 mod behavior;
 mod capture;
 mod config;

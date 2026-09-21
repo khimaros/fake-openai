@@ -14,8 +14,12 @@ product requirements for `fake-openai`. these must not regress in a release.
    and the http admin api. when the queue is empty, fall back to a default
    response that is the fixed `ok` stream unless overridden by
    `--default-response` or the admin api.
-5. capture every request as `{path, headers, body}` and expose it for inspection
-   via the admin api and an optional jsonl log (file and/or stdout).
+5. capture every request as `{path, headers, body, audio}` and expose it for
+   inspection via the admin api and an optional jsonl log (file and/or stdout).
+   `audio` measures the s16_le payload a transcription request carried
+   (`{bytes, samples, peak, rms, silent}`) and is null for every other request:
+   `body` is lossy for binary, so without it a consumer cannot tell a caller that
+   sent speech from one that sent silence.
 6. support a configurable `stall_first_with_tools` behavior that delays the first
    tools-bearing, non-heartbeat request, with a configurable `[heartbeat]`
    sentinel that exempts heartbeat requests.

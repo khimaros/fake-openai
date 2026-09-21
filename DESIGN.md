@@ -33,6 +33,7 @@ tiny_http accept (one thread per request)
        POST /v1/audio/speech       -> handlers::audio (tts)
        POST /v1/audio/transcriptions -> handlers::audio (stt)
        GET/POST /v1/audio/voices   -> handlers::audio (list / clone)
+       GET/POST /v1/voices         -> handlers::audio (registry list / enrol)
        POST /v1/images/generations -> handlers::images
        GET  /v1/models[/{id}]      -> handlers::models
        (no match)                  -> 404 with an endpoint listing
@@ -77,6 +78,17 @@ deterministic pcm (raw, or sse `speech.audio.delta` frames when the request asks
 for `stream_format: "sse"`), transcriptions returns a fixed `{"text": ...}`, and
 voices lists a default voice. responses are deterministic rather than queue-driven
 since these paths are exercised for their bytes, not their content.
+
+voice enrolment is served on TWO paths that answer differently, because the
+servers do. `/v1/audio/voices` returns an openai-shaped voice object; `/v1/voices`
+is the crispasr registry, which gates on `consent_attestation` and answers 201
+describing the stored file, with no `id` to read. collapsing them onto one reply
+would let a client pass here on a shape no real server sends.
+
+the registry is the one audio path that KEEPS STATE (`State::voices`), because
+its second-most-common answer is about what it already holds: re-enrolling a
+taken name is a 409 the caller clears with `?force=true`. answering 201 forever
+would make a workflow that runs twice pass here and fail on its second real run.
 
 ## programmable responses
 

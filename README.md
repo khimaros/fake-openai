@@ -55,12 +55,27 @@ or set the provider `base_url` / `baseURL` in the harness config to the same val
   coprime with the 2-byte s16_le sample width, so a stream that slipped by one
   byte cannot coincidentally re-align.
 - `POST /v1/audio/transcriptions` -- speech-to-text. accepts a multipart upload
-  and returns a fixed `{"text": ...}` transcript.
+  and returns a fixed `{"text": ...}` transcript. the audio it carried is
+  MEASURED into the capture as `audio: {bytes, samples, peak, rms, silent}`, so
+  a caller can prove it sent speech rather than silence -- `body` is lossy for
+  binary and cannot answer that.
 - `GET /v1/audio/voices` -- lists a default voice for onboarding probes.
 - `POST /v1/audio/voices` -- voice cloning. accepts a multipart sample and
   returns the created voice, named after the request's `name` field (default
   `cloned-voice`), which a caller feeds back as the `voice` of a later speech
   request.
+- `GET /v1/voices` -- the registry list, as `{"voices": [{"name", "format"}]}`:
+  the preset plus everything enrolled so far.
+- `POST /v1/voices` -- registry enrolment, the shape crispasr-style servers
+  carry. takes the sample as `voice` and the transcript as `transcript`, and
+  requires a `consent_attestation` field -- without it the reply is `400` with
+  `code: "consent_required"`. answers `201 {"name", "format", "size_bytes"}`,
+  describing the stored file rather than an openai voice object.
+
+  THE REGISTRY REMEMBERS what it stored. a second enrolment under a name already
+  taken is `409` until the request adds `?force=true`, which is the failure a
+  workflow re-run hits and a stateless registry answering `201` forever hides.
+  `POST /__admin/reset` empties it.
 - `POST /v1/images/generations` -- returns a real 1x1 png, so a client that
   decodes and writes the payload gets image bytes rather than a placeholder.
   honors `n` and `response_format` (`b64_json` default, or a `data:` url).
@@ -79,9 +94,15 @@ advertises -- the standard openai fields are filled in where absent:
   "meta": {"llamaswap": {"aliases": ["llm-1"], "modsi": "text,image", "modso": "text"}}}]
 ```
 
-a client that filters a model picker by modality, or resolves a stable alias to
-whatever model currently sits behind it, needs this metadata to have anything to
-read. `clients/python/fakeopenai.py` has a `llamaswap_model()` builder for it.
+a tts model may also carry `"voices"`, the comma-separated speaker presets baked
+into it. those belong to ONE model, so a server-wide voice listing cannot stand
+in for them -- a client that offers another model's presets is giving a wrong
+answer rather than an incomplete one.
+
+a client that filters a model picker by modality, resolves a stable alias to
+whatever model currently sits behind it, or fills a voice picker from the model
+it is pinned to, needs this metadata to have anything to read.
+`clients/python/fakeopenai.py` has a `llamaswap_model()` builder for it.
 
 ## llama-swap extensions
 
@@ -184,6 +205,31 @@ address instead.
 `--validate-chat` (or behavior `validate_chat`, default off) rejects a chat
 request missing a `model`, missing `messages`, or lacking a bearer Authorization
 header with an openai-style 400/401, before the queue is consumed.
+
+## rejecting silent audio
+
+`--reject-silent-audio` (or behavior `reject_silent_audio`, default off) answers
+a transcription request whose audio is silent with an openai-style 400 instead
+of a transcript.
+
+DEFAULT OFF, because answering anything is the right stub behavior and every
+existing consumer relies on it. turn it on when the point of the test is that
+audio really arrived: a mock that transcribes silence cannot tell a working
+capture path from a dead one, and a harness whose microphone had been delivering
+zeros for months passed every spoken test until it did.
+
+## requiring consent to speak as a cloned voice
+
+`--require-voice-consent` (or behavior `require_voice_consent`, default off)
+rejects a `/v1/audio/speech` request naming a voice other than the preset unless
+it carries a `consent_attestation`, answering `400` with `code:
+"consent_required"` -- what crispasr-style servers do.
+
+ENROLMENT IS NOT THE ONLY GATE on those servers, and that is the point of the
+flag. a client that sends the attestation when it uploads a sample clears
+`POST /v1/voices` and then fails on the very next request that speaks as the
+voice it just created. with the gate off, that client passes here and breaks in
+production on its second call.
 
 ## context window
 
