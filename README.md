@@ -80,8 +80,14 @@ or set the provider `base_url` / `baseURL` in the harness config to the same val
   decodes and writes the payload gets image bytes rather than a placeholder.
   honors `n` and `response_format` (`b64_json` default, or a `data:` url).
 
+- `GET /props`, `POST /tokenize`, `POST /completion` -- llama.cpp's NATIVE
+  endpoints, for a client that reads a probability distribution instead of
+  generating text. behind `--llamacpp`, **default off**; see "llama.cpp native
+  api".
+
 any other path returns 404 with an `endpoints` listing of what is served (so a
-bare `GET /v1` is a discovery aid, not a model list).
+bare `GET /v1` is a discovery aid, not a model list). a family gated off is not in
+the listing either: advertising `/props` while disabled advertises a lie.
 
 ## models and metadata
 
@@ -119,6 +125,60 @@ surface a llama-swap gateway adds:
 it is off by default so the mock answers as a plain openai-compatible server
 unless a caller opts in -- which lets one test prove a client works against a
 vanilla server and another prove its gateway fallback path works.
+
+## llama.cpp native api
+
+`--llamacpp` (or behavior `llamacpp`, **default off**) serves the endpoints
+llama.cpp's own server carries beside the openai ones, which a client that reads
+PROBABILITIES instead of generating text needs:
+
+- `GET /props` -- `chat_template` (configure it with `--chat-template`, or at
+  runtime with `POST /__admin/behavior {"chat_template": "..."}`), the bos/eos
+  tokens, and `n_vocab`. a decision client derives its prompt affixes from the
+  template, so it has to be the one the caller configured and not one invented
+  here.
+- `POST /tokenize` -- byte-level: one id per byte, bos 256, eos 257, 258 pieces
+  total. the point of a derivable id is that a caller scripts "the answer was B"
+  as `B` and the ids a client resolved by calling `/tokenize` still agree with the
+  ids the scoring response reports. no fixture to keep in sync with a tokenizer
+  that belongs to somebody else.
+- `POST /completion` -- one scored position. returns
+  `completion_probabilities[0].top_logprobs`, each `{id, prob, logprob, token}`,
+  sorted by probability and **padded or truncated to `min(n_probs, n_vocab)`**.
+  the width is the contract: a client walks `n_probs` precisely to tell "outside
+  the top k" from "probability zero", and answering 1 with the whole distribution
+  deletes that case.
+
+these hang off the ORIGIN and not off `/v1`, so the python client exposes
+`root_url` for them. behind `--llamaswap` they are also served at
+`/upstream/<model>/<path>` -- with no `/v1`, because llama.cpp's native endpoints
+sit below the openai ones on the real server.
+
+scoring is programmed through its own FIFO, because one generated turn carries
+many scoring calls and a single queue holding both would make neither sequence
+readable:
+
+```json
+// POST /__admin/probs
+{"probs": {"A": 0.25, "B": 0.75}, "cache_n": 30, "delay_ms": 0}
+{"probs": {"65": 0.9, "66": 0.1}}          // keys are one char or a token id
+{"status": 503, "error": "model not loaded"}  // a failing backend
+```
+
+`--default-probs <json>` (or `PUT /__admin/default_probs`) answers the reads the
+queue does not cover. a client that widens `n_probs` scores the SAME question more
+than once, so a queue of one spec is consumed by the first read and the second
+answers whatever it likes -- which makes the widened path untestable. the default
+says "every read answers this way", and the queue still takes precedence over it,
+exactly as `--default-response` does for chat.
+
+probabilities come back EXACTLY as scripted and are not renormalised: scripting
+0.4 and 0.6 across two of fifty-two labels is how a caller tests what its client
+does with a distribution whose mass is mostly elsewhere, which is the option-mass
+health check and not a rounding error to tidy away. an empty queue answers the
+first label with all the mass; `n_probs` defaults to 64 when a request omits it.
+native errors are a bare `{"error": "..."}` STRING, not openai's error object --
+the two shapes are not interchangeable.
 
 ## programming responses
 
@@ -253,13 +313,20 @@ the `/__admin` namespace shares the port and is never itself captured.
 
 | method | path | body | result |
 |--------|------|------|--------|
-| GET | /__admin/health | - | `{ok, captures, pending_responses}` |
-| GET | /__admin/captures | - | `{captures: [{path, headers, body}, ...]}` |
-| POST | /__admin/reset | - | clear captures + re-arm the stall latch |
+| GET | /__admin/health | - | `{ok, captures, pending_responses, pending_probs}` |
+| GET | /__admin/captures | - | `{captures: [{path, headers, body, audio}, ...]}` |
+| POST | /__admin/reset | - | clear captures, voices and both queues + re-arm the stall latch |
 | GET | /__admin/responses | - | the pending response queue |
 | POST | /__admin/responses | spec or [spec] | append; `{ok, pending}` |
 | PUT | /__admin/responses | [spec] | replace the queue |
 | DELETE | /__admin/responses | - | clear the queue |
+| GET | /__admin/probs | - | the pending SCORING queue (llama.cpp `/completion`) |
+| POST | /__admin/probs | spec or [spec] | append; `{ok, pending}`, or 400 naming a token that does not exist |
+| PUT | /__admin/probs | [spec] | replace the scoring queue |
+| DELETE | /__admin/probs | - | clear the scoring queue |
+| GET | /__admin/default_probs | - | the scoring fallback, or null when built-in |
+| PUT | /__admin/default_probs | spec | set the empty-queue scoring answer |
+| DELETE | /__admin/default_probs | - | restore the built-in scoring answer |
 | GET | /__admin/default | - | the fallback spec, or null when built-in |
 | PUT | /__admin/default | spec | set the empty-queue fallback |
 | DELETE | /__admin/default | - | restore the built-in `ok` fallback |
@@ -315,6 +382,11 @@ with fakeopenai.FakeOpenAI("--consume-only-with-tools") as fake:
     for cap in fake.chat_captures():
         assert not fakeopenai.is_heartbeat_request(cap["body"])
 ```
+
+`root_url` is the origin without `/v1`, which is where llama.cpp's native
+endpoints live, and `program_probs` / `set_probs` / `probs` / `clear_probs` /
+`set_default_probs` drive the scoring queue. a spec naming a token the vocabulary does not carry raises, and
+nothing is stored.
 
 the binary auto-resolves to this checkout's `target/debug/fake-openai`
 (`FAKE_OPENAI_BIN` overrides). `make test-python` runs the client's self-test,

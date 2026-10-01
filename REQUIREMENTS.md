@@ -52,3 +52,13 @@ product requirements for `fake-openai`. these must not regress in a release.
     `chars_per_token` (default 4), and rejects a request whose derived prompt
     exceeds the window with a `context_length_exceeded` 400 before the queue is
     consumed. this closes the feedback loop a harness's own compaction depends on.
+15. keep every non-openai endpoint family behind a behavior flag that defaults
+    off, and make a disabled family neither routed nor advertised. consumers of
+    requirement 2 need to prove their client works against a plain openai server,
+    and a mock that answers extra paths on its own cannot demonstrate that.
+16. answer a scoring request (`llama.cpp`'s native `/completion`) with `n_probs`
+    entries, probabilities exactly as scripted and NOT renormalised, and token ids
+    that agree with what `/tokenize` reports for the same text. padding the list
+    out to the requested width is what keeps "outside the top k" distinguishable
+    from "probability zero", and a client that reads option mass has to be able to
+    script a distribution that is mostly somewhere else.

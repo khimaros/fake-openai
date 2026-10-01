@@ -17,6 +17,7 @@ const FLAG_HOST: &str = "--host";
 const FLAG_PORT: &str = "--port";
 const FLAG_RESPONSES: &str = "--responses";
 const FLAG_DEFAULT_RESPONSE: &str = "--default-response";
+const FLAG_DEFAULT_PROBS: &str = "--default-probs";
 const FLAG_STDIN: &str = "--stdin";
 const FLAG_LOG_FILE: &str = "--log-file";
 const FLAG_LOG_STDOUT: &str = "--log-stdout";
@@ -33,6 +34,8 @@ const FLAG_REQUIRE_VOICE_CONSENT: &str = "--require-voice-consent";
 const FLAG_CONTEXT_WINDOW: &str = "--context-window";
 const FLAG_CHARS_PER_TOKEN: &str = "--chars-per-token";
 const FLAG_LLAMASWAP: &str = "--llamaswap";
+const FLAG_LLAMACPP: &str = "--llamacpp";
+const FLAG_CHAT_TEMPLATE: &str = "--chat-template";
 const FLAG_EMPTY_TRANSCRIPT: &str = "--empty-transcript";
 const FLAG_SPEECH_FILE: &str = "--speech-file";
 const FLAG_SPEECH_FOR: &str = "--speech-for";
@@ -44,6 +47,9 @@ pub struct Config {
     pub responses_file: Option<PathBuf>,
     // overrides the built-in fallback returned when the queue is empty.
     pub default_response: Option<Value>,
+    // as above, for llama.cpp's /completion: the distribution answered when the
+    // scoring queue is empty.
+    pub default_probs: Option<Value>,
     pub stdin: bool,
     pub log_file: Option<PathBuf>,
     pub log_stdout: bool,
@@ -75,6 +81,7 @@ impl Default for Config {
             port: 0,
             responses_file: None,
             default_response: None,
+            default_probs: None,
             stdin: false,
             log_file: None,
             log_stdout: false,
@@ -103,6 +110,10 @@ pub fn parse_args(args: Vec<String>) -> Result<Config, String> {
             FLAG_DEFAULT_RESPONSE => {
                 let raw = take(&mut it, inline, FLAG_DEFAULT_RESPONSE)?;
                 c.default_response = Some(parse_json(&raw, FLAG_DEFAULT_RESPONSE)?);
+            }
+            FLAG_DEFAULT_PROBS => {
+                let raw = take(&mut it, inline, FLAG_DEFAULT_PROBS)?;
+                c.default_probs = Some(parse_json(&raw, FLAG_DEFAULT_PROBS)?);
             }
             FLAG_STDIN => c.stdin = true,
             FLAG_LOG_FILE => c.log_file = Some(take(&mut it, inline, FLAG_LOG_FILE)?.into()),
@@ -149,6 +160,10 @@ pub fn parse_args(args: Vec<String>) -> Result<Config, String> {
                 )?
             }
             FLAG_LLAMASWAP => c.behavior.llamaswap = true,
+            FLAG_LLAMACPP => c.behavior.llamacpp = true,
+            FLAG_CHAT_TEMPLATE => {
+                c.behavior.chat_template = Some(take(&mut it, inline, FLAG_CHAT_TEMPLATE)?)
+            }
             FLAG_EMPTY_TRANSCRIPT => c.behavior.empty_transcript = true,
             FLAG_SPEECH_FILE => {
                 c.speech_file = Some(take(&mut it, inline, FLAG_SPEECH_FILE)?.into())
@@ -230,6 +245,9 @@ pub fn usage() -> String {
     u.push_str(
         "  --default-response <json> response when the queue is empty (default: ok stream)\n",
     );
+    u.push_str(
+        "  --default-probs <json>    scoring answer when the queue is empty (--llamacpp)\n",
+    );
     u.push_str("  --stdin                   read response specs as jsonl from stdin\n");
     u.push_str(
         "  --models <a,b,...>        model ids reported by /v1/models (default fake-model)\n",
@@ -256,6 +274,12 @@ pub fn usage() -> String {
     );
     u.push_str(
         "  --llamaswap               serve llama-swap's /upstream/<model>/v1/* and aliases\n",
+    );
+    u.push_str(
+        "  --llamacpp                serve llama.cpp's native /props, /tokenize, /completion\n",
+    );
+    u.push_str(
+        "  --chat-template <text>    what /props reports as chat_template (default chatml)\n",
     );
     u.push_str(
         "  --empty-transcript        transcriptions answer {\"text\": \"\"} (a silent clip)\n",

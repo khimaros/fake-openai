@@ -32,6 +32,50 @@ const FLAG_REQUIRE_VOICE_CONSENT: &str = "--require-voice-consent";
 const DEFAULT_VOICE: &str = "alloy";
 const IMAGES_PATH: &str = "/v1/images/generations";
 
+// llama.cpp's NATIVE endpoints, which its own server serves at the root and
+// llama-swap fronts at /upstream/<model>/. served only under --llamacpp.
+const PROPS_PATH: &str = "/props";
+const TOKENIZE_PATH: &str = "/tokenize";
+const COMPLETION_PATH: &str = "/completion";
+const FLAG_LLAMACPP: &str = "--llamacpp";
+const FLAG_CHAT_TEMPLATE: &str = "--chat-template";
+const LLAMA_PROBS_PATH: &str = "/__admin/probs";
+// the byte-level vocabulary: 256 bytes plus the two specials a client reads
+// from /props, so a token id is derivable from the text that produced it.
+const VOCAB: u64 = 258;
+const BOS_ID: u64 = 256;
+const TEMPLATE: &str = "{% for m in messages %}{{ m.role }}\n{{ m.content }}\n{% endfor %}";
+
+// a scoring request in the shape llama.cpp's /completion takes.
+fn completion_body(prompt: &str, n_probs: u64) -> String {
+    format!(
+        "{{\"prompt\":\"{prompt}\",\"n_predict\":1,\"n_probs\":{n_probs},\
+         \"cache_prompt\":true,\"post_sampling_probs\":false,\"temperature\":-1.0}}"
+    )
+}
+
+// a token id array as numbers, for asserting on byte-level tokenization.
+fn ids(v: &Value) -> Vec<u64> {
+    v.as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|t| t.as_u64())
+        .collect()
+}
+
+// the scored distribution out of a /completion response, in the order given.
+fn entries(body: &str) -> Vec<Value> {
+    json(body)["completion_probabilities"][0]["top_logprobs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn approx(v: f64, want: f64) -> bool {
+    (v - want).abs() < 1e-6
+}
+
 // a streaming chat request body, optionally tools-bearing and/or a heartbeat.
 fn chat_body(tools: bool, heartbeat: bool, stream: bool) -> String {
     let content = if heartbeat {
@@ -1583,5 +1627,293 @@ fn a_body_with_no_audio_is_not_measured() {
         .find(|c| c["path"].as_str() == Some(TRANSCRIPTIONS_PATH))
         .expect("a capture");
     assert!(cap["audio"].is_null(), "measured audio that was not there: {cap}");
+}
+
+// llama.cpp's native scoring surface (--llamacpp). a decision harness reads a
+// probability distribution off one token position instead of generating text, so
+// what it needs from a mock is a distribution the test CHOSE. real weights cannot
+// be told that, which is why every consumer of this family is a test of the
+// client rather than of a model.
+
+#[test]
+fn llama_endpoints_stay_closed_until_enabled() {
+    let s = Server::spawn(&[]);
+    let (status, body) = s.get(PROPS_PATH);
+    assert_eq!(status, 404, "props answered without --llamacpp");
+    let endpoints = json(&body)["endpoints"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !endpoints
+            .iter()
+            .any(|e| e.as_str().unwrap_or("").contains("props")),
+        "the listing advertises a disabled family: {body}"
+    );
+    for path in [TOKENIZE_PATH, COMPLETION_PATH] {
+        assert_eq!(
+            s.post(path, "{}").0,
+            404,
+            "{path} answered without --llamacpp"
+        );
+    }
+}
+
+#[test]
+fn llama_props_report_a_template_and_a_vocab() {
+    let s = Server::spawn(&[FLAG_LLAMACPP, FLAG_CHAT_TEMPLATE, TEMPLATE]);
+    let (status, body) = s.get(PROPS_PATH);
+    assert_eq!(status, 200);
+    let v = json(&body);
+    // a client derives its prompt affixes from the template, so the string it
+    // gets back has to be the one that was configured.
+    assert_eq!(v["chat_template"].as_str(), Some(TEMPLATE));
+    assert_eq!(v["n_vocab"].as_u64(), Some(VOCAB));
+    assert!(v["bos_token"].as_str().is_some_and(|t| !t.is_empty()));
+    assert!(v["eos_token"].as_str().is_some_and(|t| !t.is_empty()));
+}
+
+#[test]
+fn llama_tokenize_is_byte_level() {
+    let s = Server::spawn(&[FLAG_LLAMACPP]);
+    let (status, body) = s.post(
+        TOKENIZE_PATH,
+        &serde_json::json!({"content": "A B"}).to_string(),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(ids(&json(&body)["tokens"]), vec![65, 32, 66]);
+
+    // ids come out of here and go back in as the labels to score, so the two
+    // ends of a session have to agree without anyone writing them down.
+    let (_, body) = s.post(
+        TOKENIZE_PATH,
+        &serde_json::json!({"content": "A", "add_special": true}).to_string(),
+    );
+    assert_eq!(ids(&json(&body)["tokens"]), vec![BOS_ID, 65]);
+}
+
+#[test]
+fn llama_completion_without_a_spec_answers_the_first_label() {
+    let s = Server::spawn(&[FLAG_LLAMACPP]);
+    let (status, body) = s.post(COMPLETION_PATH, &completion_body("hello", 64));
+    assert_eq!(status, 200);
+    let e = entries(&body);
+    // padded out to the requested width, the way a real server returns the top n
+    // of a whole vocabulary. a short list is how a client learns it saw the
+    // entire distribution, so padding is not decoration.
+    assert_eq!(e.len(), 64, "answered {} of 64: {body}", e.len());
+    assert_eq!(e[0]["id"].as_u64(), Some(65), "default answer: {body}");
+    assert_eq!(e[0]["token"].as_str(), Some("A"));
+    assert!(approx(e[0]["logprob"].as_f64().unwrap(), 1.0_f64.ln()));
+    // the greedy token is the top of the distribution, as it is on the real one
+    assert_eq!(json(&body)["choices"][0]["text"].as_str(), Some("A"));
+}
+
+#[test]
+fn llama_completion_pops_the_programmed_distributions() {
+    let s = Server::spawn(&[FLAG_LLAMACPP]);
+    s.post(
+        LLAMA_PROBS_PATH,
+        &serde_json::json!({"probs": {"A": 0.25, "B": 0.75}}).to_string(),
+    );
+    s.post(
+        LLAMA_PROBS_PATH,
+        &serde_json::json!({"probs": {"A": 0.9, "B": 0.1}}).to_string(),
+    );
+
+    let (_, body) = s.post(COMPLETION_PATH, &completion_body("q1", 64));
+    let e = entries(&body);
+    assert_eq!(e[0]["id"].as_u64(), Some(66), "B should be on top: {body}");
+    assert!(approx(e[0]["logprob"].as_f64().unwrap(), 0.75_f64.ln()));
+
+    let (_, body) = s.post(COMPLETION_PATH, &completion_body("q2", 64));
+    let e = entries(&body);
+    assert_eq!(e[0]["id"].as_u64(), Some(65));
+    assert!(approx(e[0]["logprob"].as_f64().unwrap(), 0.9_f64.ln()));
+    // probabilities are reported as well as log probabilities, since the whole
+    // point of scripting them is asserting on them.
+    assert!(approx(e[0]["prob"].as_f64().unwrap(), 0.9));
+
+    // and the queue is empty again: the default, not a repeat of the last spec.
+    let (_, body) = s.post(COMPLETION_PATH, &completion_body("q3", 64));
+    assert!(approx(entries(&body)[0]["prob"].as_f64().unwrap(), 1.0));
+}
+
+#[test]
+fn llama_completion_truncates_to_the_requested_width() {
+    // n_probs is what a client walks to tell "outside the top k" from "zero",
+    // so answering n_probs=1 with the whole scripted distribution would erase
+    // the one failure mode the ladder exists to catch.
+    let s = Server::spawn(&[FLAG_LLAMACPP]);
+    s.post(
+        LLAMA_PROBS_PATH,
+        &serde_json::json!({"probs": {"A": 0.4, "B": 0.6}}).to_string(),
+    );
+    let (_, body) = s.post(COMPLETION_PATH, &completion_body("q", 1));
+    let e = entries(&body);
+    assert_eq!(e.len(), 1, "n_probs=1 returned {}: {body}", e.len());
+    assert_eq!(e[0]["id"].as_u64(), Some(66));
+}
+
+#[test]
+fn llama_completion_reports_the_prompt_it_was_given() {
+    let s = Server::spawn(&[FLAG_LLAMACPP]);
+    let (_, body) = s.post(COMPLETION_PATH, &completion_body("hello there", 8));
+    assert_eq!(json(&body)["timings"]["prompt_n"].as_u64(), Some(11));
+    let (_, body) = s.post(COMPLETION_PATH, &completion_body("hello there you", 8));
+    assert_eq!(
+        json(&body)["timings"]["prompt_n"].as_u64(),
+        Some(15),
+        "a longer prompt has to report a longer prompt_n"
+    );
+
+    // a prompt sent as token ids is counted in ids, which is the other shape a
+    // client sends.
+    let (_, body) = s.post(
+        COMPLETION_PATH,
+        &serde_json::json!({"prompt": [65, 66, 67], "n_probs": 8}).to_string(),
+    );
+    assert_eq!(json(&body)["timings"]["prompt_n"].as_u64(), Some(3));
+
+    // a scripted cache_n is reported as-is: prefix reuse is a property the
+    // client asserts on, and a fixed zero cannot tell hot from cold.
+    s.post(
+        LLAMA_PROBS_PATH,
+        &serde_json::json!({"probs": {"A": 1.0}, "cache_n": 30}).to_string(),
+    );
+    let (_, body) = s.post(COMPLETION_PATH, &completion_body("hello there you", 8));
+    assert_eq!(json(&body)["timings"]["cache_n"].as_u64(), Some(30));
+}
+
+#[test]
+fn llama_completion_serves_a_failing_upstream() {
+    let s = Server::spawn(&[FLAG_LLAMACPP]);
+    s.post(
+        LLAMA_PROBS_PATH,
+        &serde_json::json!({"status": 503, "error": "model not loaded"}).to_string(),
+    );
+    let (status, body) = s.post(COMPLETION_PATH, &completion_body("q", 8));
+    assert_eq!(status, 503, "the fault was not served: {body}");
+    // llama.cpp's native errors are a bare string, not openai's error object, and
+    // a client that tells an operator what happened reads it directly.
+    assert_eq!(json(&body)["error"].as_str(), Some("model not loaded"));
+}
+
+#[test]
+fn llama_requests_are_captured() {
+    let s = Server::spawn(&[FLAG_LLAMACPP]);
+    s.post(COMPLETION_PATH, &completion_body("what queue", 8));
+    let caps = s.captures();
+    let cap = caps
+        .iter()
+        .rev()
+        .find(|c| c["path"].as_str() == Some(COMPLETION_PATH))
+        .expect("a capture");
+    // the prompt a client assembled is the fact worth asserting on, and the
+    // scoring answer says nothing about whether it was built correctly.
+    assert_eq!(cap["body"]["prompt"].as_str(), Some("what queue"));
+}
+
+#[test]
+fn llama_native_routes_behind_the_gateway_prefix() {
+    // llama-swap fronts the native endpoints at /upstream/<model>/<path> with no
+    // /v1, which is a different rewrite from the openai routes it already does.
+    let s = Server::spawn(&[FLAG_LLAMACPP]);
+    let (status, _) = s.get("/upstream/qwen3.5-9b:Q8_0/props");
+    assert_eq!(
+        status, 404,
+        "the gateway prefix answered without --llamaswap"
+    );
+
+    let s = Server::spawn(&[FLAG_LLAMACPP, "--llamaswap"]);
+    assert_eq!(s.get("/upstream/qwen3.5-9b:Q8_0/props").0, 200);
+    let (status, body) = s.post(
+        "/upstream/qwen3.5-9b:Q8_0/completion",
+        &completion_body("q", 8),
+    );
+    assert_eq!(status, 200, "scoring behind the prefix: {body}");
+}
+
+#[test]
+fn a_default_scoring_answer_replies_to_every_read() {
+    // a client that widens n_probs scores the same question more than once, so a
+    // queue of one spec is gone after the first read. the default is how a caller
+    // says "answer this way until told otherwise".
+    let s = Server::spawn(&[
+        FLAG_LLAMACPP,
+        "--default-probs",
+        r#"{"probs":{"A":0.1,"B":0.9}}"#,
+    ]);
+    let (_, body) = s.post(COMPLETION_PATH, &completion_body("q1", 64));
+    assert_eq!(entries(&body)[0]["id"].as_u64(), Some(66), "the default did not answer: {body}");
+    let (_, body) = s.post(COMPLETION_PATH, &completion_body("q2", 64));
+    assert_eq!(
+        entries(&body)[0]["id"].as_u64(),
+        Some(66),
+        "the default answered once and then stopped"
+    );
+
+    // a programmed spec still comes first, and the default resumes after it.
+    s.post(LLAMA_PROBS_PATH, &serde_json::json!({"probs": {"A": 1.0}}).to_string());
+    let (_, body) = s.post(COMPLETION_PATH, &completion_body("q3", 64));
+    assert_eq!(entries(&body)[0]["id"].as_u64(), Some(65));
+    let (_, body) = s.post(COMPLETION_PATH, &completion_body("q4", 64));
+    assert_eq!(entries(&body)[0]["id"].as_u64(), Some(66));
+
+    // inspectable and clearable, like the chat fallback.
+    let (_, body) = s.get("/__admin/default_probs");
+    assert!(body.contains("0.9"), "the default is not reported: {body}");
+    s.req("DELETE", "/__admin/default_probs", "");
+    let (_, body) = s.post(COMPLETION_PATH, &completion_body("q5", 64));
+    assert_eq!(
+        entries(&body)[0]["id"].as_u64(),
+        Some(65),
+        "clearing the default did not restore the built-in answer: {body}"
+    );
+}
+
+#[test]
+fn a_scoring_spec_naming_an_unknown_token_is_refused() {
+    let s = Server::spawn(&[FLAG_LLAMACPP]);
+    let (status, body) = s.post(
+        LLAMA_PROBS_PATH,
+        &serde_json::json!({"probs": {"not a token": 1.0}}).to_string(),
+    );
+    assert_eq!(status, 400, "a bad spec was accepted: {body}");
+    // and it is stored nowhere. answering a named token with a different one is
+    // worse than refusing, since the whole point is that the distribution is the
+    // one the caller asked for.
+    let (_, body) = s.get(LLAMA_PROBS_PATH);
+    assert_eq!(
+        json(&body)["probs"].as_array().map(|a| a.len()),
+        Some(0),
+        "the refused spec was kept: {body}"
+    );
+}
+
+#[test]
+fn the_scoring_queue_is_separate_from_the_chat_queue() {
+    let s = Server::spawn(&[FLAG_LLAMACPP]);
+    s.post(
+        LLAMA_PROBS_PATH,
+        &serde_json::json!({"probs": {"A": 1.0}}).to_string(),
+    );
+    let (_, body) = s.get(LLAMA_PROBS_PATH);
+    assert_eq!(
+        json(&body)["probs"].as_array().map(|a| a.len()),
+        Some(1),
+        "the scoring queue is not inspectable: {body}"
+    );
+    assert_eq!(s.pending(), 0, "a scoring spec hit the chat queue");
+
+    // a generated turn and a scored turn are different requests, and a decision
+    // run issues many of the second per the first.
+    s.post(CHAT_PATH, &chat_body(false, false, false));
+    let (status, body) = s.post(COMPLETION_PATH, &completion_body("q", 8));
+    assert_eq!(status, 200);
+    assert!(
+        approx(entries(&body)[0]["prob"].as_f64().unwrap(), 1.0),
+        "the chat request consumed the scoring spec: {body}"
+    );
 }
 

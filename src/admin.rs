@@ -15,6 +15,8 @@ pub const ROUTES: &[&str] = &[
     "POST /__admin/reset",
     "GET|POST|PUT|DELETE /__admin/responses",
     "GET|PUT|DELETE /__admin/default",
+    "GET|POST|PUT|DELETE /__admin/probs",
+    "GET|PUT|DELETE /__admin/default_probs",
     "GET|POST /__admin/behavior",
     "GET|PUT /__admin/models",
 ];
@@ -24,7 +26,8 @@ pub fn handle(state: &Shared, req: &ParsedRequest, path: &str) -> HttpResponse {
     match (req.method.as_str(), sub) {
         ("GET", "/health") => HttpResponse::json(
             200,
-            &json!({"ok": true, "captures": state.capture_count(), "pending_responses": state.pending()}),
+            &json!({"ok": true, "captures": state.capture_count(), "pending_responses": state.pending(),
+                     "pending_probs": state.probs_pending()}),
         ),
         ("GET", "/captures") => {
             HttpResponse::json(200, &json!({"captures": state.captures_snapshot()}))
@@ -40,6 +43,32 @@ pub fn handle(state: &Shared, req: &ParsedRequest, path: &str) -> HttpResponse {
         ("PUT", "/responses") => ok_pending(state.responses_replace(&req.body)),
         ("DELETE", "/responses") => {
             state.responses_clear();
+            ok()
+        }
+        // the scoring queue, programmatic peer of /__admin/responses. a spec that
+        // names a token this vocabulary does not have is refused rather than
+        // quietly answered with a different token, since the whole value of the
+        // family is that the distribution is the one that was asked for.
+        ("GET", "/probs") => HttpResponse::json(200, &json!({"probs": state.probs_snapshot()})),
+        ("POST", "/probs") => match state.probs_append(&req.body) {
+            Ok(n) => ok_pending(n),
+            Err(e) => bad_request(e),
+        },
+        ("PUT", "/probs") => match state.probs_replace(&req.body) {
+            Ok(n) => ok_pending(n),
+            Err(e) => bad_request(e),
+        },
+        ("DELETE", "/probs") => {
+            state.probs_clear();
+            ok()
+        }
+        ("GET", "/default_probs") => HttpResponse::json(200, &state.default_probs_value()),
+        ("PUT", "/default_probs") => match state.set_default_probs(&req.body) {
+            Ok(()) => ok(),
+            Err(e) => bad_request(e),
+        },
+        ("DELETE", "/default_probs") => {
+            state.clear_default_probs();
             ok()
         }
         ("GET", "/default") => HttpResponse::json(200, &state.default_response_value()),
@@ -70,6 +99,10 @@ pub fn handle(state: &Shared, req: &ParsedRequest, path: &str) -> HttpResponse {
 
 fn ok() -> HttpResponse {
     HttpResponse::json(200, &json!({"ok": true}))
+}
+
+fn bad_request(message: String) -> HttpResponse {
+    HttpResponse::json(400, &json!({"ok": false, "error": message}))
 }
 
 fn ok_pending(n: usize) -> HttpResponse {

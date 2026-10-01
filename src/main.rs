@@ -7,6 +7,7 @@ mod behavior;
 mod capture;
 mod config;
 mod handlers;
+mod llama;
 mod response;
 mod responses;
 mod router;

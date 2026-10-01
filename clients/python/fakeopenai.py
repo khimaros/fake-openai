@@ -110,6 +110,48 @@ def set_default(admin_url, spec):
     _admin(admin_url, "/default", "PUT", spec)
 
 
+def probs(admin_url):
+    """the pending scoring specs, as programmed."""
+    return _admin(admin_url, "/probs").get("probs", [])
+
+
+def program_probs(admin_url, specs):
+    """append one scoring spec or a list of them to the /completion queue.
+
+    a spec is `{"probs": {"A": 0.9, "B": 0.1}, "cache_n": 0, "status": 200,
+    "error": null, "delay_ms": 0}`. keys are a single character or a token id.
+    a spec naming something the vocabulary does not carry raises, and nothing is
+    stored: answering a token the caller did not name would bury that mistake in
+    a green test.
+    """
+    _admin(admin_url, "/probs", "POST", specs)
+
+
+def set_probs(admin_url, specs):
+    """replace the whole scoring queue."""
+    _admin(admin_url, "/probs", "PUT", specs)
+
+
+def clear_probs(admin_url):
+    """empty the scoring queue, so /completion answers the default again."""
+    _admin(admin_url, "/probs", "DELETE")
+
+
+def set_default_probs(admin_url, spec):
+    """set the scoring answer used when the queue is empty.
+
+    a client that widens its `n_probs` scores the same question more than once, so
+    a queue of one spec is gone before the read that matters. setting the default
+    is how a caller says "every read answers this way".
+    """
+    _admin(admin_url, "/default_probs", "PUT", spec)
+
+
+def clear_default_probs(admin_url):
+    """restore the built-in scoring answer: the first label, all the mass."""
+    _admin(admin_url, "/default_probs", "DELETE")
+
+
 def set_models(admin_url, ids):
     """set the model list reported by /v1/models.
 
@@ -166,6 +208,10 @@ class FakeOpenAI:
         self.proc = None
         self.base_url = None
         self.admin_url = None
+        # the origin, without the /v1 the openai endpoints hang off. llama.cpp's
+        # native endpoints live at the root, so a caller driving those cannot use
+        # base_url.
+        self.root_url = None
 
     def start(self):
         """launch on a free port and block until base_url is announced."""
@@ -179,7 +225,8 @@ class FakeOpenAI:
                 break
             if line.startswith(BASE_URL_PREFIX):
                 self.base_url = line.strip()[len(BASE_URL_PREFIX):]
-                self.admin_url = self.base_url.rsplit("/v1", 1)[0] + "/__admin"
+                self.root_url = self.base_url.rsplit("/v1", 1)[0]
+                self.admin_url = self.root_url + "/__admin"
                 return self
         self.stop()
         raise RuntimeError("fake-openai did not announce base_url")
@@ -217,6 +264,24 @@ class FakeOpenAI:
 
     def set_default(self, spec):
         set_default(self.admin_url, spec)
+
+    def probs(self):
+        return probs(self.admin_url)
+
+    def program_probs(self, specs):
+        program_probs(self.admin_url, specs)
+
+    def set_probs(self, specs):
+        set_probs(self.admin_url, specs)
+
+    def clear_probs(self):
+        clear_probs(self.admin_url)
+
+    def set_default_probs(self, spec):
+        set_default_probs(self.admin_url, spec)
+
+    def clear_default_probs(self):
+        clear_default_probs(self.admin_url)
 
     def set_models(self, ids):
         set_models(self.admin_url, ids)

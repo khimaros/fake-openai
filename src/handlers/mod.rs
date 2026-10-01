@@ -7,6 +7,7 @@ use crate::state::Shared;
 pub mod audio;
 pub mod chat;
 pub mod images;
+pub mod llama;
 pub mod models;
 
 // matched by (method, path); path has any query string stripped.
@@ -15,6 +16,11 @@ pub trait Handler {
     fn handle(&self, state: &Shared, req: &ParsedRequest) -> HttpResponse;
     // the routes this handler serves, advertised in the 404 endpoint listing.
     fn routes(&self) -> &'static [&'static str];
+    // a family gated on a behavior flag is absent while it is off: neither routed
+    // nor advertised, so a surface nobody asked for is not even a hint.
+    fn enabled(&self, _state: &Shared) -> bool {
+        true
+    }
 }
 
 // minimal standard base64 encoder; embeds binary payloads (pcm frames, png

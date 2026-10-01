@@ -12,6 +12,7 @@ use crate::handlers::{
     audio::{AudioSpeech, AudioTranscriptions, AudioVoices, VoiceRegistry},
     chat::ChatCompletions,
     images::ImagesGenerations,
+    llama::{Completion, Props, Tokenize},
     models::Models,
     Handler,
 };
@@ -32,6 +33,18 @@ fn strip_upstream_prefix(path: &str) -> Option<String> {
     Some(format!("/v1/{tail}"))
 }
 
+// "/upstream/<model>/completion" -> "/completion". llama.cpp's native endpoints
+// sit BELOW the openai ones on the real server, with no /v1 in front of them, so
+// they need a second rewrite rather than a looser first one.
+fn strip_native_prefix(path: &str) -> Option<String> {
+    let rest = path.strip_prefix(UPSTREAM_PREFIX)?;
+    let (_model, tail) = rest.split_once('/')?;
+    if tail.starts_with("v1/") {
+        return None;
+    }
+    Some(format!("/{tail}"))
+}
+
 impl Router {
     pub fn new() -> Router {
         // order matters: specific paths before the /v1/models matcher.
@@ -44,6 +57,9 @@ impl Router {
                 Box::new(VoiceRegistry),
                 Box::new(ImagesGenerations),
                 Box::new(Models),
+                Box::new(Props),
+                Box::new(Tokenize),
+                Box::new(Completion),
             ],
         }
     }
@@ -78,26 +94,30 @@ impl Router {
         // client works against a plain openai server.
         let path = if path.starts_with(UPSTREAM_PREFIX) {
             match state.llamaswap_enabled() {
-                true => strip_upstream_prefix(&path).unwrap_or(path),
-                false => return self.not_found(&req.method, &path),
+                true => strip_upstream_prefix(&path)
+                    .or_else(|| strip_native_prefix(&path))
+                    .unwrap_or(path),
+                false => return self.not_found(state, &req.method, &path),
             }
         } else {
             path
         };
         for handler in &self.handlers {
-            if handler.matches(&req.method, &path) {
+            if handler.enabled(state) && handler.matches(&req.method, &path) {
                 return handler.handle(state, req);
             }
         }
-        self.not_found(&req.method, &path)
+        self.not_found(state, &req.method, &path)
     }
 
     // a 404 that advertises the served endpoints, so an unknown path is a
-    // discovery aid rather than a dead end.
-    fn not_found(&self, method: &str, path: &str) -> HttpResponse {
+    // discovery aid rather than a dead end. a family gated off is not listed:
+    // advertising /props while --llamacpp is off would advertise a lie.
+    fn not_found(&self, state: &Shared, method: &str, path: &str) -> HttpResponse {
         let mut endpoints: Vec<&str> = self
             .handlers
             .iter()
+            .filter(|h| h.enabled(state))
             .flat_map(|h| h.routes())
             .copied()
             .collect();

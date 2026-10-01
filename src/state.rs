@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use crate::behavior::Behavior;
+use crate::behavior::{Behavior, DEFAULT_CHAT_TEMPLATE};
 use crate::config::{normalize_model, Config};
+use crate::llama::{push_score_specs, ScoreSpec};
 use crate::responses::{push_specs, ResponseSpec};
 
 pub type Shared = Arc<State>;
@@ -18,7 +19,18 @@ pub struct State {
     pub responses: Mutex<VecDeque<ResponseSpec>>,
     // the fallback used when the queue is empty; None means the built-in stream.
     pub default_response: Mutex<Option<ResponseSpec>>,
+    /// the scoring fallback when the queue is empty; None keeps "all the mass on
+    /// the first label". needed because a client may score the SAME question more
+    /// than once -- a ladder walk for a widened `n_probs` -- and a caller that
+    /// wants every one of those reads answered the same way cannot say so with a
+    /// queue of one.
+    pub default_probs: Mutex<Option<ScoreSpec>>,
     pub behavior: Mutex<Behavior>,
+    /// The queue behind llama.cpp's `/completion`: one scored distribution per
+    /// request. SEPARATE from `responses` because a decision run issues many
+    /// scoring calls for each generated turn, and one queue carrying both would
+    /// make neither sequence readable.
+    pub probs: Mutex<VecDeque<ScoreSpec>>,
     pub stalled_once: Mutex<bool>,
     pub models: Mutex<Vec<Value>>,
     /// Names enrolled through `POST /v1/voices`. THE REGISTRY REMEMBERS, because
@@ -76,7 +88,11 @@ impl State {
         State {
             captures: Mutex::new(Vec::new()),
             responses: Mutex::new(VecDeque::new()),
+            probs: Mutex::new(VecDeque::new()),
             default_response: Mutex::new(c.default_response.as_ref().map(ResponseSpec::from_value)),
+            default_probs: Mutex::new(c.default_probs.as_ref().map(|v| {
+                ScoreSpec::from_value(v).unwrap_or_else(|e| panic!("--default-probs: {e}"))
+            })),
             behavior: Mutex::new(c.behavior.clone()),
             stalled_once: Mutex::new(false),
             models: Mutex::new(c.models.clone()),
@@ -124,6 +140,7 @@ impl State {
     pub fn reset(&self) {
         self.captures.lock().unwrap().clear();
         self.voices.lock().unwrap().clear();
+        self.probs.lock().unwrap().clear();
         *self.stalled_once.lock().unwrap() = false;
     }
 
@@ -180,6 +197,56 @@ impl State {
         self.responses.lock().unwrap().clear();
     }
 
+    pub fn default_probs(&self) -> Option<ScoreSpec> {
+        self.default_probs.lock().unwrap().clone()
+    }
+
+    pub fn set_default_probs(&self, body: &Value) -> Result<(), String> {
+        let spec = ScoreSpec::from_value(body)?;
+        *self.default_probs.lock().unwrap() = Some(spec);
+        Ok(())
+    }
+
+    pub fn clear_default_probs(&self) {
+        *self.default_probs.lock().unwrap() = None;
+    }
+
+    pub fn probs_pop(&self) -> Option<ScoreSpec> {
+        self.probs.lock().unwrap().pop_front()
+    }
+
+    pub fn probs_pending(&self) -> usize {
+        self.probs.lock().unwrap().len()
+    }
+
+    pub fn default_probs_value(&self) -> Value {
+        json!({"default": self.default_probs.lock().unwrap().as_ref().map(|s| s.to_value())})
+    }
+
+    pub fn probs_snapshot(&self) -> Vec<Value> {
+        self.probs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.to_value())
+            .collect()
+    }
+
+    pub fn probs_append(&self, body: &Value) -> Result<usize, String> {
+        let mut q = self.probs.lock().unwrap();
+        push_score_specs(&mut q, body)
+    }
+
+    pub fn probs_replace(&self, body: &Value) -> Result<usize, String> {
+        let mut q = self.probs.lock().unwrap();
+        q.clear();
+        push_score_specs(&mut q, body)
+    }
+
+    pub fn probs_clear(&self) {
+        self.probs.lock().unwrap().clear();
+    }
+
     pub fn behavior_value(&self) -> Value {
         let b = self.behavior.lock().unwrap();
         json!({
@@ -194,6 +261,8 @@ impl State {
             "context_window": b.context_window,
             "chars_per_token": b.chars_per_token,
             "llamaswap": b.llamaswap,
+            "llamacpp": b.llamacpp,
+            "chat_template": b.chat_template.clone().map(Value::from).unwrap_or(Value::Null),
             "empty_transcript": b.empty_transcript,
             "speech_frame_delay_ms": b.speech_frame_delay_ms,
             "transcript": b.transcript,
@@ -242,6 +311,17 @@ impl State {
         if let Some(v) = body.get("llamaswap").and_then(|x| x.as_bool()) {
             b.llamaswap = v;
         }
+        if let Some(v) = body.get("llamacpp").and_then(|x| x.as_bool()) {
+            b.llamacpp = v;
+        }
+        // an explicit null restores the built-in template; a string replaces it.
+        if let Some(v) = body.get("chat_template") {
+            b.chat_template = if v.is_null() {
+                None
+            } else {
+                v.as_str().map(str::to_string)
+            };
+        }
         if let Some(v) = body.get("speech_frame_delay_ms").and_then(|x| x.as_u64()) {
             b.speech_frame_delay_ms = v;
         }
@@ -257,6 +337,19 @@ impl State {
 
     pub fn llamaswap_enabled(&self) -> bool {
         self.behavior.lock().unwrap().llamaswap
+    }
+
+    pub fn llamacpp_enabled(&self) -> bool {
+        self.behavior.lock().unwrap().llamacpp
+    }
+
+    pub fn chat_template(&self) -> String {
+        self.behavior
+            .lock()
+            .unwrap()
+            .chat_template
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CHAT_TEMPLATE.to_string())
     }
 
     pub fn models_snapshot(&self) -> Vec<Value> {

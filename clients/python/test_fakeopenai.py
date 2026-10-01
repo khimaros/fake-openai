@@ -8,6 +8,7 @@ run from anywhere: `python3 clients/python/test_fakeopenai.py` (or via
 
 import json
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -103,6 +104,81 @@ def main():
         # the query param pi-omni sends on its first voices probe must survive.
         st, _, blob = http("GET", au + "/voices?model=tts-1")
         check("voices tolerates a ?model= query", st == 200 and json.loads(blob).get("voices"))
+
+    # llama.cpp's native family, which a decision client reads probabilities out
+    # of. it hangs off the origin and not off /v1, which is what root_url is for.
+    with fakeopenai.FakeOpenAI("--llamacpp") as fake:
+        root = fake.root_url
+
+        def score(n_probs=8):
+            _, _, raw = http("POST", root + "/completion",
+                             {"prompt": "hi", "n_probs": n_probs},
+                             {"Content-Type": "application/json"})
+            return json.loads(raw)["completion_probabilities"][0]["top_logprobs"][0]
+
+        _, _, blob = http("GET", root + "/props")
+        check("props reports a chat_template", "chat_template" in json.loads(blob))
+
+        _, _, blob = http("POST", root + "/tokenize", {"content": "A B"},
+                         {"Content-Type": "application/json"})
+        check("tokenize is byte level", json.loads(blob).get("tokens") == [65, 32, 66])
+
+        _, _, blob = http("POST", root + "/completion",
+                         {"prompt": "hi", "n_probs": 8},
+                         {"Content-Type": "application/json"})
+        top = json.loads(blob)["completion_probabilities"][0]["top_logprobs"][0]
+        check("an unprogrammed scoring call answers the first label",
+              top["id"] == 65 and top["prob"] == 1.0, str(top))
+
+        fake.program_probs({"probs": {"A": 0.25, "B": 0.75}})
+        check("the scoring queue is inspectable", len(fake.probs()) == 1)
+        _, _, blob = http("POST", root + "/completion",
+                         {"prompt": "hi", "n_probs": 8},
+                         {"Content-Type": "application/json"})
+        top = json.loads(blob)["completion_probabilities"][0]["top_logprobs"][0]
+        check("the programmed distribution is what came back",
+              top["id"] == 66 and abs(top["prob"] - 0.75) < 1e-9, str(top))
+
+        # n_probs is how a client tells "outside the top k" from "zero", so the
+        # width the caller asked for is part of the contract.
+        _, _, blob = http("POST", root + "/completion",
+                         {"prompt": "hi", "n_probs": 1},
+                         {"Content-Type": "application/json"})
+        check("n_probs is honored",
+              len(json.loads(blob)["completion_probabilities"][0]["top_logprobs"]) == 1)
+
+        try:
+            fake.program_probs({"probs": {"not a token": 1.0}})
+            check("an unknown token is refused", False, "the spec was accepted")
+        except urllib.error.HTTPError as e:
+            check("an unknown token is refused", e.code == 400, f"status {e.code}")
+        check("a refused spec is not queued", len(fake.probs()) == 0)
+
+        fake.clear_probs()
+        _, _, blob = http("POST", root + "/completion",
+                         {"prompt": "hi", "n_probs": 8},
+                         {"Content-Type": "application/json"})
+        top = json.loads(blob)["completion_probabilities"][0]["top_logprobs"][0]
+        check("clear_probs restores the built-in answer", top["id"] == 65, str(top))
+
+        # the empty-queue default, which is what a client that widens n_probs -- and
+        # so scores one question twice -- actually needs.
+        fake.set_default_probs({"probs": {"A": 0.1, "B": 0.9}})
+        first = score()
+        check("the default scoring answer applies",
+              first["id"] == 66 and abs(first["prob"] - 0.9) < 1e-9, str(first))
+        check("and to every read, not just the first", score()["id"] == 66)
+        fake.clear_default_probs()
+        check("clear_default_probs restores the built-in answer", score()["id"] == 65)
+
+    with fakeopenai.FakeOpenAI() as fake:
+        # urlopen raises on 4xx, which is the answer wanted here.
+        try:
+            st, _, _ = http("GET", fake.root_url + "/props")
+            check("native endpoints stay closed without --llamacpp", False, f"status {st}")
+        except urllib.error.HTTPError as e:
+            check("native endpoints stay closed without --llamacpp", e.code == 404,
+                  f"status {e.code}")
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

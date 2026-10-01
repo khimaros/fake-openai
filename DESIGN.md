@@ -27,7 +27,7 @@ tiny_http accept (one thread per request)
   -> body -> serde_json::Value (fallback {"_raw": <utf8-lossy>})
   -> path starts with /__admin? -> admin handler (NOT captured)
   -> else: capture {path, headers, body} into State + optional jsonl sink
-  -> /upstream/<model>/v1/... ? -> strip prefix if llamaswap on, else 404
+  -> /upstream/<model>/... ? -> strip the gateway prefix if llamaswap on, else 404
   -> router dispatch by (method, path):
        POST /v1/chat/completions   -> handlers::chat
        POST /v1/audio/speech       -> handlers::audio (tts)
@@ -36,6 +36,9 @@ tiny_http accept (one thread per request)
        GET/POST /v1/voices         -> handlers::audio (registry list / enrol)
        POST /v1/images/generations -> handlers::images
        GET  /v1/models[/{id}]      -> handlers::models
+       GET  /props                 -> handlers::llama::Props      (--llamacpp)
+       POST /tokenize              -> handlers::llama::Tokenize   (--llamacpp)
+       POST /completion            -> handlers::llama::Completion (--llamacpp)
        (no match)                  -> 404 with an endpoint listing
   -> non-admin: pay connect_delay_ms (slow-first-byte injection), then capture
   -> write response; ignore broken pipe
@@ -56,8 +59,8 @@ mirroring the single lock the python mock used.
 
 ## endpoint extensibility
 
-each endpoint family implements a `Handler` (`matches`, `handle`, and `routes`)
-and is registered in an ordered list in `router.rs`. capture, logging, and admin
+each endpoint family implements a `Handler` (`matches`, `handle`, `routes`, and
+`enabled`) and is registered in an ordered list in `router.rs`. capture, logging, and admin
 inspection are cross-cutting, applied before dispatch, so adding a family only
 implements that family's request/response shape and the routes it advertises. a
 request that matches nothing returns 404 whose body lists every handler's
@@ -66,12 +69,56 @@ are added (the models handler is scoped to `/v1/models`, so a bare `/v1` 404s
 rather than masquerading as a model list). the `/__admin` namespace is matched
 before `/v1` so control-plane paths never collide with api paths.
 
+a family gated on a behavior flag implements `enabled` alongside `matches`, and a
+disabled one is skipped in dispatch AND left out of the 404 listing. advertising a
+surface that then refuses to answer is worse than silence about it: the listing is
+what a caller reads to work out what kind of server this is.
+
 vendor extensions to the openai surface are gated on a behavior flag rather than
 built into a handler's matcher, so they can be turned off wholesale: the router
 rewrites (or rejects) llama-swap's `/upstream/<model>/v1/*` before dispatch,
 which keeps one implementation per endpoint family and leaves the handlers
 unaware of the gateway. they default off so the mock is a plain
 openai-compatible server unless a caller opts in.
+
+## llama.cpp's native api
+
+`--llamacpp` adds the endpoints a decision harness reads probabilities out of:
+`/props`, `/tokenize` and `/completion` at the ORIGIN, below the `/v1` the openai
+routes hang off. llama-swap fronts those at `/upstream/<model>/<path>`, also
+without `/v1`, which is why the gateway rewrite has two shapes: loosening the one
+prefix to cover both would let `/upstream/x/v1/chat/completions` fall into a native
+handler.
+
+the vocabulary is byte-level (`llama.rs`): id == byte, plus bos 256 and eos 257.
+the property that matters is that an id is DERIVABLE from text rather than looked
+up, because a client resolves its option labels by calling `/tokenize` and scores
+whatever ids come back -- if the ids the scoring response reported were ever
+somewhere else, every scripted distribution would be testing the wrong token. the
+cost is in the roadmap: 258 pieces carry every ascii letter and nothing outside it,
+so a client labelling options with non-ascii single characters cannot be
+exercised here.
+
+the scoring queue has an empty-queue DEFAULT (`--default-probs`,
+`PUT /__admin/default_probs`) for the same reason the chat queue has one, and it
+earns its keep on a specific case: a client that widens `n_probs` scores one
+question twice, so a queue of one spec is spent on the first read and the second
+silently answers something else. the default is what makes the widened path
+testable, and the queue still wins over it.
+
+scoring draws on a SECOND queue (`State::probs`), fed by `/__admin/probs`, for the
+same reason the audio family does not share the chat queue: real clients
+interleave the two kinds of request -- many scoring calls per generated turn --
+and a caller's scripted sequence stops being readable once it has to survive that.
+
+`/completion` pads or truncates its answer to `min(n_probs, n_vocab)` and reports
+probabilities unrenormalised. both are load-bearing. the width is how a client
+tells "outside the top k" from "probability zero", and its whole widening ladder
+is built on that distinction; a caller scripting 0.4/0.6 across two of fifty-two
+labels is testing the option-mass health check, so renormalising would answer a
+question that was not asked. `timings.prompt_n` is derived from the request for
+the same reason `context_window` derives usage: a fixed number cannot express
+prefix reuse.
 
 the audio family (`handlers::audio`) covers pi-omni's voice paths: speech returns
 deterministic pcm (raw, or sse `speech.audio.delta` frames when the request asks

@@ -131,3 +131,59 @@ to silently mask broken wiring).
       attests only at enrolment fails here rather than on its second real call.
       off by default because it is a crispasr extension, not openai.
 
+## v0.8: llama.cpp's native api, for a client that reads probabilities
+
+driven by `verdict`, a decision-model harness that reads the probability mass on
+declared option tokens at one position and generates no text. it talks to
+llama.cpp's NATIVE api (`/props`, `/tokenize`, `/completion` with `n_probs`) and
+not to the openai surface, so nothing here could drive it -- which left that
+consumer's e2e tests needing real weights and a live server. they could then only
+assert what the model happened to score, never that the client coped with a
+distribution the test CHOSE: low mass, a label outside the top k, a backend that
+went away mid-decision.
+
+- [x] opt-in `llamacpp` behavior (`--llamacpp`, default off, so the openai
+      surface a dozen consumers depend on does not move): `GET /props`,
+      `POST /tokenize`, `POST /completion`
+- [x] `--chat-template <text>` to configure what `/props` reports (also settable
+      at runtime through `/__admin/behavior`, the way `transcript` is), since a client
+      derives its prompt affixes from that template and has to be able to be told
+      what template it is answering
+- [x] a byte-level tokenizer: id == byte, bos 256, eos 257, n_vocab 258. the
+      point is that a token id is DERIVABLE from the text, so the ids a client
+      resolves by calling `/tokenize` always agree with the ids the scoring
+      response reports, and a test scripts "the answer was B" as `B`
+- [x] a SECOND response queue for scoring specs (`GET|POST|PUT|DELETE
+      /__admin/probs`), each `{probs, cache_n, status, error, delay_ms}`. the chat
+      queue cannot carry both: one generated turn issues many scoring calls, and
+      interleaving them would make either queue's sequence unreadable. a spec naming
+      a token the vocabulary lacks is a 400 and stores nothing; the file and stdin
+      channels the chat queue has are not wired up for it yet
+- [x] `/completion` renders `completion_probabilities[0].top_logprobs` sorted by
+      probability with `logprob = ln(p)`, padded to `min(n_probs, n_vocab)`
+      entries. the padding and the truncation are the feature: `n_probs` is how a
+      client tells "not in the top k" from "probability zero", and a mock that
+      always answers the whole distribution erases the case
+- [x] `--default-probs` / `PUT /__admin/default_probs`: the empty-queue scoring
+      answer. a client that widens `n_probs` scores one question twice, so a queue
+      of one spec is spent on the first read and the second answers something else
+      -- which left the widened path untestable until the default existed
+- [x] `timings.prompt_n` derived from the request (the same argument as
+      `context_window`'s derived usage): a longer prompt reports a longer
+      prompt_n, so prefix reuse and cache accounting are assertable at all
+- [x] native routes behind the gateway prefix: llama-swap serves them at
+      `/upstream/<model>/<path>` with NO `/v1`, which the existing rewrite does
+      not strip. gated on `llamaswap` as well, so a client's plain and gateway
+      paths are two separate proofs
+- [x] native errors as a bare `{"error": "..."}` STRING, unlike openai's error
+      object: the two shapes are not interchangeable and a client that renders
+      one shows an operator nothing when it reads the other
+- [x] verdict: a python e2e suite driving its jev server against the mock, with no
+      weights anywhere (`python/tests_e2e/test_fake_backend.py`) -- a formatter
+      derived from the configured template, the prompt as the backend received it,
+      mass landed off the option labels, a 503 arriving as a retryable 529
+
+known gap: a 258-piece byte vocabulary cannot exercise the wide alphabet, which
+needs single-character non-ascii tokens past the 52 ascii letters. either the
+vocabulary grows a configurable synthetic range or that path stays model-bound.
+

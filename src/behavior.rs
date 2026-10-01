@@ -9,9 +9,21 @@ pub const DEFAULT_STALL_SECONDS: u64 = 5;
 // land near four characters per token for prose; a caller tunes it per content
 // (dense code/base64 packs closer to two) with --chars-per-token.
 pub const DEFAULT_CHARS_PER_TOKEN: u64 = 4;
+// the smallest template that carries the three roles a decision client renders:
+// one turn per message, and a generation prompt naming the assistant.
+pub const DEFAULT_CHAT_TEMPLATE: &str =
+    "{% for m in messages %}{{ m.role }}\n{{ m.content }}\n{% endfor %}assistant\n";
 
 #[derive(Clone)]
 pub struct Behavior {
+    // llama.cpp's NATIVE endpoints (/props, /tokenize, /completion), which a
+    // decision harness reads probabilities out of. off by default: this binary is
+    // an openai mock, and a family that answers when nobody asked for it would
+    // make "it speaks openai" unprovable.
+    pub llamacpp: bool,
+    // what /props reports as chat_template, which a client derives its prompt
+    // affixes from. None keeps a minimal chatml template.
+    pub chat_template: Option<String>,
     pub stall_first_with_tools: bool,
     pub stall_seconds: u64,
     pub heartbeat_sentinel: String,
@@ -73,6 +85,8 @@ pub struct Behavior {
 impl Default for Behavior {
     fn default() -> Behavior {
         Behavior {
+            llamacpp: false,
+            chat_template: None,
             stall_first_with_tools: false,
             stall_seconds: DEFAULT_STALL_SECONDS,
             heartbeat_sentinel: HEARTBEAT_SENTINEL.to_string(),
