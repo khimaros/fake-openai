@@ -9,7 +9,9 @@ use serde_json::{json, Value};
 
 use crate::behavior::{Behavior, DEFAULT_CHAT_TEMPLATE};
 use crate::config::{normalize_model, Config};
-use crate::llama::{push_score_specs, ScoreSpec};
+use crate::llama::{
+    push_embedding_specs, push_score_specs, EmbeddingSpec, ScoreSpec, POOLINGS,
+};
 use crate::responses::{push_specs, ResponseSpec};
 
 pub type Shared = Arc<State>;
@@ -31,6 +33,14 @@ pub struct State {
     /// scoring calls for each generated turn, and one queue carrying both would
     /// make neither sequence readable.
     pub probs: Mutex<VecDeque<ScoreSpec>>,
+    /// The queue behind llama.cpp's embedding routes: one hidden state per
+    /// request, for a client that applies a decision head itself. a third queue
+    /// for the reason `probs` is a second: these are a different kind of read.
+    pub embeddings: Mutex<VecDeque<EmbeddingSpec>>,
+    /// the embedding fallback when that queue is empty; None derives every
+    /// position from its token id. a client verifies a head with several reads
+    /// before it serves one, which a queue of one cannot answer.
+    pub default_embedding: Mutex<Option<EmbeddingSpec>>,
     pub stalled_once: Mutex<bool>,
     pub models: Mutex<Vec<Value>>,
     /// Names enrolled through `POST /v1/voices`. THE REGISTRY REMEMBERS, because
@@ -89,6 +99,8 @@ impl State {
             captures: Mutex::new(Vec::new()),
             responses: Mutex::new(VecDeque::new()),
             probs: Mutex::new(VecDeque::new()),
+            embeddings: Mutex::new(VecDeque::new()),
+            default_embedding: Mutex::new(None),
             default_response: Mutex::new(c.default_response.as_ref().map(ResponseSpec::from_value)),
             default_probs: Mutex::new(c.default_probs.as_ref().map(|v| {
                 ScoreSpec::from_value(v).unwrap_or_else(|e| panic!("--default-probs: {e}"))
@@ -141,6 +153,7 @@ impl State {
         self.captures.lock().unwrap().clear();
         self.voices.lock().unwrap().clear();
         self.probs.lock().unwrap().clear();
+        self.embeddings.lock().unwrap().clear();
         *self.stalled_once.lock().unwrap() = false;
     }
 
@@ -247,6 +260,61 @@ impl State {
         self.probs.lock().unwrap().clear();
     }
 
+    pub fn embeddings_pop(&self) -> Option<EmbeddingSpec> {
+        self.embeddings.lock().unwrap().pop_front()
+    }
+
+    pub fn embeddings_pending(&self) -> usize {
+        self.embeddings.lock().unwrap().len()
+    }
+
+    pub fn embeddings_snapshot(&self) -> Vec<Value> {
+        self.embeddings
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.to_value())
+            .collect()
+    }
+
+    pub fn embeddings_append(&self, body: &Value) -> Result<usize, String> {
+        push_embedding_specs(&mut self.embeddings.lock().unwrap(), body)
+    }
+
+    // parsed before the queue is emptied, so a refused replacement leaves the
+    // queue it would have replaced.
+    pub fn embeddings_replace(&self, body: &Value) -> Result<usize, String> {
+        let mut fresh = VecDeque::new();
+        let n = push_embedding_specs(&mut fresh, body)?;
+        *self.embeddings.lock().unwrap() = fresh;
+        Ok(n)
+    }
+
+    pub fn embeddings_clear(&self) {
+        self.embeddings.lock().unwrap().clear();
+    }
+
+    pub fn default_embedding(&self) -> Option<EmbeddingSpec> {
+        self.default_embedding.lock().unwrap().clone()
+    }
+
+    pub fn default_embedding_value(&self) -> Value {
+        json!({"default": self.default_embedding.lock().unwrap().as_ref().map(|s| s.to_value())})
+    }
+
+    pub fn set_default_embedding(&self, body: &Value) -> Result<(), String> {
+        *self.default_embedding.lock().unwrap() = Some(EmbeddingSpec::from_value(body)?);
+        Ok(())
+    }
+
+    pub fn clear_default_embedding(&self) {
+        *self.default_embedding.lock().unwrap() = None;
+    }
+
+    pub fn pooling(&self) -> Option<String> {
+        self.behavior.lock().unwrap().pooling.clone()
+    }
+
     pub fn behavior_value(&self) -> Value {
         let b = self.behavior.lock().unwrap();
         json!({
@@ -263,6 +331,7 @@ impl State {
             "llamaswap": b.llamaswap,
             "llamacpp": b.llamacpp,
             "chat_template": b.chat_template.clone().map(Value::from).unwrap_or(Value::Null),
+            "pooling": b.pooling,
             "empty_transcript": b.empty_transcript,
             "speech_frame_delay_ms": b.speech_frame_delay_ms,
             "transcript": b.transcript,
@@ -321,6 +390,15 @@ impl State {
             } else {
                 v.as_str().map(str::to_string)
             };
+        }
+        // an explicit null closes the embedding routes; a pooling this server
+        // does not model is ignored rather than served as some other one.
+        if let Some(v) = body.get("pooling") {
+            match v.as_str() {
+                Some(p) if POOLINGS.contains(&p) => b.pooling = Some(p.to_string()),
+                None if v.is_null() => b.pooling = None,
+                _ => {}
+            }
         }
         if let Some(v) = body.get("speech_frame_delay_ms").and_then(|x| x.as_u64()) {
             b.speech_frame_delay_ms = v;

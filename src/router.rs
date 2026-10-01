@@ -12,7 +12,7 @@ use crate::handlers::{
     audio::{AudioSpeech, AudioTranscriptions, AudioVoices, VoiceRegistry},
     chat::ChatCompletions,
     images::ImagesGenerations,
-    llama::{Completion, Props, Tokenize},
+    llama::{Completion, Embedding, Props, Tokenize},
     models::Models,
     Handler,
 };
@@ -60,6 +60,7 @@ impl Router {
                 Box::new(Props),
                 Box::new(Tokenize),
                 Box::new(Completion),
+                Box::new(Embedding),
             ],
         }
     }

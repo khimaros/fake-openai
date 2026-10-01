@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 
 use crate::behavior::Behavior;
+use crate::llama::POOLINGS;
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 // the model name reported by /v1/models (default) and echoed in responses.
@@ -36,6 +37,7 @@ const FLAG_CHARS_PER_TOKEN: &str = "--chars-per-token";
 const FLAG_LLAMASWAP: &str = "--llamaswap";
 const FLAG_LLAMACPP: &str = "--llamacpp";
 const FLAG_CHAT_TEMPLATE: &str = "--chat-template";
+const FLAG_POOLING: &str = "--pooling";
 const FLAG_EMPTY_TRANSCRIPT: &str = "--empty-transcript";
 const FLAG_SPEECH_FILE: &str = "--speech-file";
 const FLAG_SPEECH_FOR: &str = "--speech-for";
@@ -164,6 +166,13 @@ pub fn parse_args(args: Vec<String>) -> Result<Config, String> {
             FLAG_CHAT_TEMPLATE => {
                 c.behavior.chat_template = Some(take(&mut it, inline, FLAG_CHAT_TEMPLATE)?)
             }
+            FLAG_POOLING => {
+                let pooling = take(&mut it, inline, FLAG_POOLING)?;
+                if !POOLINGS.contains(&pooling.as_str()) {
+                    return Err(format!("{FLAG_POOLING}: expected one of {POOLINGS:?}"));
+                }
+                c.behavior.pooling = Some(pooling)
+            }
             FLAG_EMPTY_TRANSCRIPT => c.behavior.empty_transcript = true,
             FLAG_SPEECH_FILE => {
                 c.speech_file = Some(take(&mut it, inline, FLAG_SPEECH_FILE)?.into())
@@ -280,6 +289,10 @@ pub fn usage() -> String {
     );
     u.push_str(
         "  --chat-template <text>    what /props reports as chat_template (default chatml)\n",
+    );
+    u.push_str(
+        "  --pooling <none|last>     also serve /embedding and /v1/embeddings (--llamacpp):\n\
+         \x20                         a hidden state per position, or the last one alone\n",
     );
     u.push_str(
         "  --empty-transcript        transcriptions answer {\"text\": \"\"} (a silent clip)\n",

@@ -152,6 +152,47 @@ def clear_default_probs(admin_url):
     _admin(admin_url, "/default_probs", "DELETE")
 
 
+def embeddings(admin_url):
+    """the pending embedding specs, as programmed."""
+    return _admin(admin_url, "/embeddings").get("embeddings", [])
+
+
+def program_embeddings(admin_url, specs):
+    """append one embedding spec or a list of them to the embedding queue.
+
+    a spec is `{"vector": [...], "status": 200, "error": null, "delay_ms": 0}`.
+    `vector` is the hidden state at the LAST position of the prompt, the one a
+    decision head reads; every other position is its token id repeated across the
+    vector's width. needs `--llamacpp --pooling none|last`. a spec whose vector is
+    not a non-empty list of numbers raises, and nothing is stored.
+    """
+    _admin(admin_url, "/embeddings", "POST", specs)
+
+
+def set_embeddings(admin_url, specs):
+    """replace the whole embedding queue."""
+    _admin(admin_url, "/embeddings", "PUT", specs)
+
+
+def clear_embeddings(admin_url):
+    """empty the embedding queue, so a request answers the default again."""
+    _admin(admin_url, "/embeddings", "DELETE")
+
+
+def set_default_embedding(admin_url, spec):
+    """set the embedding answer used when the queue is empty.
+
+    a client verifies a head with several reads before it serves one, so "every
+    read answers this way" has to be sayable once.
+    """
+    _admin(admin_url, "/default_embedding", "PUT", spec)
+
+
+def clear_default_embedding(admin_url):
+    """restore the built-in answer: every position derived from its token id."""
+    _admin(admin_url, "/default_embedding", "DELETE")
+
+
 def set_models(admin_url, ids):
     """set the model list reported by /v1/models.
 
@@ -282,6 +323,24 @@ class FakeOpenAI:
 
     def clear_default_probs(self):
         clear_default_probs(self.admin_url)
+
+    def embeddings(self):
+        return embeddings(self.admin_url)
+
+    def program_embeddings(self, specs):
+        program_embeddings(self.admin_url, specs)
+
+    def set_embeddings(self, specs):
+        set_embeddings(self.admin_url, specs)
+
+    def clear_embeddings(self):
+        clear_embeddings(self.admin_url)
+
+    def set_default_embedding(self, spec):
+        set_default_embedding(self.admin_url, spec)
+
+    def clear_default_embedding(self):
+        clear_default_embedding(self.admin_url)
 
     def set_models(self, ids):
         set_models(self.admin_url, ids)

@@ -9,13 +9,80 @@
 use serde_json::{json, Value};
 
 use crate::handlers::Handler;
-use crate::llama::{self, ScoreSpec};
+use crate::llama::{self, EmbeddingSpec, ScoreSpec};
 use crate::response::{HttpResponse, ParsedRequest};
 use crate::state::Shared;
 
 pub struct Props;
 pub struct Tokenize;
 pub struct Completion;
+pub struct Embedding;
+
+// llama-server's two native embedding routes, and the openai one. the native
+// pair answer a matrix of rows; the openai one a single vector and a usage.
+const NATIVE_EMBEDDING_PATHS: &[&str] = &["/embedding", "/embeddings"];
+const OAI_EMBEDDINGS_PATH: &str = "/v1/embeddings";
+
+impl Handler for Embedding {
+    fn matches(&self, method: &str, path: &str) -> bool {
+        method == "POST" && (NATIVE_EMBEDDING_PATHS.contains(&path) || path == OAI_EMBEDDINGS_PATH)
+    }
+
+    // an embedding server is a llama-server started with a pooling, so the
+    // family needs both: without one it is the scoring server it always was.
+    fn enabled(&self, state: &Shared) -> bool {
+        state.llamacpp_enabled() && state.pooling().is_some()
+    }
+
+    fn routes(&self) -> &'static [&'static str] {
+        &["POST /embedding", "POST /embeddings", "POST /v1/embeddings"]
+    }
+
+    fn handle(&self, state: &Shared, req: &ParsedRequest) -> HttpResponse {
+        let oai = req.path.split('?').next().unwrap_or("").ends_with(OAI_EMBEDDINGS_PATH);
+        let pooled = state.pooling().as_deref() == Some(llama::POOLING_LAST);
+        if oai && !pooled {
+            // refused before the queue is read, so the spec waits for the
+            // request that can use it.
+            return HttpResponse::json(
+                400,
+                &json!({"error": {"code": 400, "type": "invalid_request_error",
+                                  "message": llama::POOLING_NONE_REFUSAL}}),
+            );
+        }
+        let prompt = req.body.get(if oai { "input" } else { "content" });
+        let tokens = match llama::prompt_ids(prompt) {
+            Some(ids) if !ids.is_empty() => ids,
+            Some(_) => return native_error(400, "the prompt is empty: no position to return"),
+            None => return native_error(400, "missing required parameter: content or input"),
+        };
+        let spec = state
+            .embeddings_pop()
+            .or_else(|| state.default_embedding())
+            .unwrap_or_else(EmbeddingSpec::default_answer);
+        if let Some(failure) = spec.failure() {
+            return failure;
+        }
+        let mut rows = spec.rows(&tokens);
+        if !pooled {
+            return HttpResponse::json(200, &json!([{"index": 0, "embedding": rows}]));
+        }
+        let last = rows.pop().unwrap_or_default();
+        let raw = req.body.get("embd_normalize").and_then(|n| n.as_i64())
+            == Some(llama::RAW_NORMALIZE);
+        let vector = if raw { last } else { llama::unit(&last) };
+        if !oai {
+            return HttpResponse::json(200, &json!([{"index": 0, "embedding": [vector]}]));
+        }
+        HttpResponse::json(
+            200,
+            &json!({"object": "list",
+                    "model": served_model(state),
+                    "data": [{"index": 0, "object": "embedding", "embedding": vector}],
+                    "usage": {"prompt_tokens": tokens.len(), "total_tokens": tokens.len()}}),
+        )
+    }
+}
 
 // a native failure is a bare {"error": "..."} string, unlike openai's object.
 fn native_error(status: u16, message: &str) -> HttpResponse {

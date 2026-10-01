@@ -123,26 +123,7 @@ impl ScoreSpec {
             None | Some(Value::Null) => {}
             Some(_) => return Err("probs must be an object of token to probability".to_string()),
         }
-        let error = match v.get("error") {
-            Some(Value::String(e)) => Some(e.clone()),
-            Some(Value::Object(_)) => Some(
-                v["error"]
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("upstream error")
-                    .to_string(),
-            ),
-            Some(_) => Some("upstream error".to_string()),
-            None => None,
-        };
-        let status = v.get("status").and_then(|x| x.as_u64()).unwrap_or(200) as u16;
-        // an error without an explicit status is still an error, and answering it
-        // with a 200 would hide the very thing the spec exists to inject.
-        let status = if error.is_some() && status == 200 {
-            500
-        } else {
-            status
-        };
+        let (error, status) = fault(v);
         Ok(ScoreSpec {
             probs,
             cache_n: v.get("cache_n").and_then(|x| x.as_u64()).unwrap_or(0),
@@ -251,6 +232,168 @@ impl ScoreSpec {
             .map(|(key, p)| (resolve_key(key).unwrap_or(DEFAULT_LABEL), *p))
             .collect()
     }
+}
+
+// the server's pooling settings an embedding client can meet. `none` returns a
+// hidden state per position and `last` the final position's alone.
+pub const POOLING_NONE: &str = "none";
+pub const POOLING_LAST: &str = "last";
+pub const POOLINGS: &[&str] = &[POOLING_NONE, POOLING_LAST];
+
+// how wide a hidden state is when nobody scripted one. small, because a test
+// that cares about the width scripts a vector, and that vector sets it.
+pub const DEFAULT_EMBEDDING_WIDTH: usize = 8;
+
+// the value of `embd_normalize` that declines normalisation. llama.cpp's default
+// is the euclidean norm, which a pooled vector gets unless the request says so.
+pub const RAW_NORMALIZE: i64 = -1;
+
+// llama-server's own words when the openai route is asked on a server pooling
+// `none`, which is how a client learns to read the native route instead.
+pub const POOLING_NONE_REFUSAL: &str =
+    "Pooling type 'none' is not OAI compatible. Please use a different pooling type";
+
+/// the token ids of a prompt as an embedding request carries it: text is one
+/// id per byte, an array of ids is itself. None when it is neither.
+pub fn prompt_ids(prompt: Option<&Value>) -> Option<Vec<u32>> {
+    match prompt? {
+        Value::String(text) => Some(token_ids(text, false)),
+        Value::Array(ids) => ids.iter().map(|id| id.as_u64().map(|n| n as u32)).collect(),
+        _ => None,
+    }
+}
+
+/// a vector scaled to unit euclidean length, as a pooled embedding is unless the
+/// request declines.
+pub fn unit(v: &[f64]) -> Vec<f64> {
+    let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm == 0.0 {
+        return v.to_vec();
+    }
+    v.iter().map(|x| x / norm).collect()
+}
+
+// one programmed embedding answer: the hidden state at the LAST position, plus
+// the timing and fault fields a client's own error paths read.
+//
+// only the last position is scripted because that is the one a decision head is
+// trained to read. every other position is derived from its token id, the way an
+// id is derived from its text: a client that reads spans of positions can check
+// what it got against what it sent, with no fixture to keep in step.
+#[derive(Clone)]
+pub struct EmbeddingSpec {
+    vector: Option<Vec<f64>>,
+    error: Option<String>,
+    status: u16,
+    delay_ms: u64,
+}
+
+impl EmbeddingSpec {
+    /// the fallback answer: every position derived, none scripted.
+    pub fn default_answer() -> EmbeddingSpec {
+        EmbeddingSpec {
+            vector: None,
+            error: None,
+            status: 200,
+            delay_ms: 0,
+        }
+    }
+
+    pub fn from_value(v: &Value) -> Result<EmbeddingSpec, String> {
+        let vector = match v.get("vector") {
+            Some(Value::Array(a)) if !a.is_empty() => Some(
+                a.iter()
+                    .map(|x| x.as_f64().ok_or("vector holds something that is not a number"))
+                    .collect::<Result<Vec<f64>, _>>()?,
+            ),
+            // a spec with no vector is a fault or a timing spec
+            None | Some(Value::Null) => None,
+            Some(_) => return Err("vector must be a non-empty array of numbers".to_string()),
+        };
+        let (error, status) = fault(v);
+        Ok(EmbeddingSpec {
+            vector,
+            error,
+            status,
+            delay_ms: v.get("delay_ms").and_then(|x| x.as_u64()).unwrap_or(0),
+        })
+    }
+
+    pub fn to_value(&self) -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("vector".to_string(), json!(self.vector));
+        m.insert("status".to_string(), json!(self.status));
+        m.insert("delay_ms".to_string(), json!(self.delay_ms));
+        if let Some(e) = &self.error {
+            m.insert("error".to_string(), json!(e));
+        }
+        Value::Object(m)
+    }
+
+    /// the scripted failure, if this spec is one, after its delay.
+    pub fn failure(&self) -> Option<HttpResponse> {
+        if self.delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+        }
+        self.error
+            .as_ref()
+            .map(|message| HttpResponse::json(self.status, &json!({"error": message})))
+    }
+
+    /// a hidden state per token: its id repeated across the width, with the
+    /// scripted vector in place of the last one.
+    pub fn rows(&self, tokens: &[u32]) -> Vec<Vec<f64>> {
+        let width = self.vector.as_ref().map_or(DEFAULT_EMBEDDING_WIDTH, |v| v.len());
+        let mut rows: Vec<Vec<f64>> = tokens.iter().map(|id| vec![*id as f64; width]).collect();
+        if let (Some(last), Some(vector)) = (rows.last_mut(), &self.vector) {
+            *last = vector.clone();
+        }
+        rows
+    }
+}
+
+// the fault fields a scripted answer may carry: an error message, and the status
+// it is answered with. shared by every spec this family queues.
+fn fault(v: &Value) -> (Option<String>, u16) {
+    let error = match v.get("error") {
+        Some(Value::String(e)) => Some(e.clone()),
+        Some(Value::Object(_)) => Some(
+            v["error"]
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("upstream error")
+                .to_string(),
+        ),
+        Some(_) => Some("upstream error".to_string()),
+        None => None,
+    };
+    let status = v.get("status").and_then(|x| x.as_u64()).unwrap_or(200) as u16;
+    // an error without an explicit status is still an error, and answering it
+    // with a 200 would hide the very thing the spec exists to inject.
+    let status = if error.is_some() && status == 200 {
+        500
+    } else {
+        status
+    };
+    (error, status)
+}
+
+/// append embedding specs from one object or an array of them. all or nothing:
+/// a refused spec leaves the queue as it was.
+pub fn push_embedding_specs(
+    q: &mut std::collections::VecDeque<EmbeddingSpec>,
+    body: &Value,
+) -> Result<usize, String> {
+    let list: Vec<&Value> = match body {
+        Value::Array(a) => a.iter().collect(),
+        _ => vec![body],
+    };
+    let specs = list
+        .into_iter()
+        .map(EmbeddingSpec::from_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    q.extend(specs);
+    Ok(q.len())
 }
 
 /// append specs from one object or an array of them, as the chat queue does.

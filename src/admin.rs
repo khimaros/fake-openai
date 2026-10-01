@@ -17,6 +17,8 @@ pub const ROUTES: &[&str] = &[
     "GET|PUT|DELETE /__admin/default",
     "GET|POST|PUT|DELETE /__admin/probs",
     "GET|PUT|DELETE /__admin/default_probs",
+    "GET|POST|PUT|DELETE /__admin/embeddings",
+    "GET|PUT|DELETE /__admin/default_embedding",
     "GET|POST /__admin/behavior",
     "GET|PUT /__admin/models",
 ];
@@ -27,7 +29,8 @@ pub fn handle(state: &Shared, req: &ParsedRequest, path: &str) -> HttpResponse {
         ("GET", "/health") => HttpResponse::json(
             200,
             &json!({"ok": true, "captures": state.capture_count(), "pending_responses": state.pending(),
-                     "pending_probs": state.probs_pending()}),
+                     "pending_probs": state.probs_pending(),
+                     "pending_embeddings": state.embeddings_pending()}),
         ),
         ("GET", "/captures") => {
             HttpResponse::json(200, &json!({"captures": state.captures_snapshot()}))
@@ -69,6 +72,32 @@ pub fn handle(state: &Shared, req: &ParsedRequest, path: &str) -> HttpResponse {
         },
         ("DELETE", "/default_probs") => {
             state.clear_default_probs();
+            ok()
+        }
+        // the embedding queue, peer of /__admin/probs for a client that reads
+        // hidden states and applies a head itself.
+        ("GET", "/embeddings") => {
+            HttpResponse::json(200, &json!({"embeddings": state.embeddings_snapshot()}))
+        }
+        ("POST", "/embeddings") => match state.embeddings_append(&req.body) {
+            Ok(n) => ok_pending(n),
+            Err(e) => bad_request(e),
+        },
+        ("PUT", "/embeddings") => match state.embeddings_replace(&req.body) {
+            Ok(n) => ok_pending(n),
+            Err(e) => bad_request(e),
+        },
+        ("DELETE", "/embeddings") => {
+            state.embeddings_clear();
+            ok()
+        }
+        ("GET", "/default_embedding") => HttpResponse::json(200, &state.default_embedding_value()),
+        ("PUT", "/default_embedding") => match state.set_default_embedding(&req.body) {
+            Ok(()) => ok(),
+            Err(e) => bad_request(e),
+        },
+        ("DELETE", "/default_embedding") => {
+            state.clear_default_embedding();
             ok()
         }
         ("GET", "/default") => HttpResponse::json(200, &state.default_response_value()),

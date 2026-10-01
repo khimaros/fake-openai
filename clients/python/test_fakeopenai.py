@@ -171,6 +171,59 @@ def main():
         fake.clear_default_probs()
         check("clear_default_probs restores the built-in answer", score()["id"] == 65)
 
+    # the same server as an EMBEDDING server, which a client reading a model
+    # through a decision head fetches hidden states from.
+    with fakeopenai.FakeOpenAI("--llamacpp", "--pooling", "last") as fake:
+        root = fake.root_url
+        headers = {"Content-Type": "application/json"}
+
+        fake.program_embeddings({"vector": [3.0, 4.0]})
+        check("the embedding queue is inspectable", len(fake.embeddings()) == 1)
+        _, _, blob = http("POST", root + "/v1/embeddings",
+                          {"input": "hello", "embd_normalize": -1}, headers)
+        reply = json.loads(blob)
+        check("the scripted vector is what came back",
+              reply["data"][0]["embedding"] == [3.0, 4.0], str(reply))
+        check("with the prompt's token count", reply["usage"]["prompt_tokens"] == 5)
+
+        fake.set_default_embedding({"vector": [3.0, 4.0]})
+        _, _, blob = http("POST", root + "/v1/embeddings", {"input": "hello"}, headers)
+        unit = json.loads(blob)["data"][0]["embedding"]
+        check("a pooled vector is normalised unless the request declines",
+              abs(unit[0] - 0.6) < 1e-9 and abs(unit[1] - 0.8) < 1e-9, str(unit))
+
+        # pooling none: a row per token, and the openai route refuses.
+        fake.behavior(pooling="none")
+        _, _, blob = http("POST", root + "/embedding", {"content": [7, 8]}, headers)
+        rows = json.loads(blob)[0]["embedding"]
+        check("every position comes back, the scripted one last",
+              rows == [[7.0, 7.0], [3.0, 4.0]], str(rows))
+        try:
+            http("POST", root + "/v1/embeddings", {"input": "hello"}, headers)
+            check("the openai route refuses pooling none", False, "it answered")
+        except urllib.error.HTTPError as e:
+            check("the openai route refuses pooling none", e.code == 400, f"status {e.code}")
+
+        fake.clear_default_embedding()
+        try:
+            fake.program_embeddings({"vector": "wide"})
+            check("a spec that is not a vector is refused", False, "the spec was accepted")
+        except urllib.error.HTTPError as e:
+            check("a spec that is not a vector is refused", e.code == 400, f"status {e.code}")
+        fake.set_embeddings([{"vector": [1.0]}, {"vector": [2.0]}])
+        check("set_embeddings replaces the queue", len(fake.embeddings()) == 2)
+        fake.clear_embeddings()
+        check("clear_embeddings empties it", len(fake.embeddings()) == 0)
+
+    with fakeopenai.FakeOpenAI("--llamacpp") as fake:
+        try:
+            http("POST", fake.root_url + "/embedding", {"content": "A"},
+                 {"Content-Type": "application/json"})
+            check("embedding routes stay closed without --pooling", False, "it answered")
+        except urllib.error.HTTPError as e:
+            check("embedding routes stay closed without --pooling", e.code == 404,
+                  f"status {e.code}")
+
     with fakeopenai.FakeOpenAI() as fake:
         # urlopen raises on 4xx, which is the answer wanted here.
         try:

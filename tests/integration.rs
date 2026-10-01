@@ -1917,3 +1917,255 @@ fn the_scoring_queue_is_separate_from_the_chat_queue() {
     );
 }
 
+// llama.cpp as an EMBEDDING server (--llamacpp --pooling <none|last>). a model
+// that answers through a trained decision head is not read by its logits: the
+// client fetches final hidden states and applies the head itself. so what it
+// needs from a mock is the vector the test CHOSE at the position its head reads,
+// and, for a head that reads every position, a row per token it sent.
+
+const EMBEDDING_PATH: &str = "/embedding";
+const OAI_EMBEDDINGS_PATH: &str = "/v1/embeddings";
+const FLAG_POOLING: &str = "--pooling";
+const LLAMA_EMBEDDINGS_PATH: &str = "/__admin/embeddings";
+const LLAMA_DEFAULT_EMBEDDING_PATH: &str = "/__admin/default_embedding";
+// the width of a hidden state nobody scripted
+const EMBEDDING_WIDTH: usize = 8;
+
+// the rows of a native embedding reply: one per position.
+fn rows(body: &str) -> Vec<Vec<f64>> {
+    json(body)[0]["embedding"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(floats)
+        .collect()
+}
+
+fn floats(v: &Value) -> Vec<f64> {
+    v.as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|x| x.as_f64())
+        .collect()
+}
+
+fn embed(s: &Server, path: &str, body: Value) -> (u16, String) {
+    s.post(path, &body.to_string())
+}
+
+#[test]
+fn embeddings_stay_closed_until_a_pooling_is_chosen() {
+    // a llama-server started without --embeddings refuses these, and a mock
+    // that answered anyway could not show a client pointed at the wrong server.
+    let s = Server::spawn(&[FLAG_LLAMACPP]);
+    for path in [EMBEDDING_PATH, "/embeddings", OAI_EMBEDDINGS_PATH] {
+        let (status, body) = embed(&s, path, serde_json::json!({"content": "A", "input": "A"}));
+        assert_eq!(status, 404, "{path} answered without --pooling: {body}");
+        // the admin routes that program the family are always listed; the
+        // routes a client would call are not
+        assert!(
+            !json(&body)["endpoints"].to_string().contains("POST /embedding")
+                && !json(&body)["endpoints"].to_string().contains("POST /v1/embeddings"),
+            "the listing advertises a disabled family: {body}"
+        );
+    }
+}
+
+#[test]
+fn pooling_none_returns_a_state_per_token_derived_from_its_id() {
+    let s = Server::spawn(&[FLAG_LLAMACPP, FLAG_POOLING, "none"]);
+    let (status, body) = embed(&s, EMBEDDING_PATH, serde_json::json!({"content": "AB"}));
+    assert_eq!(status, 200, "{body}");
+    // a row per token, and each row is its token id repeated: derivable from the
+    // prompt, like the ids themselves, so a client's spans can be checked
+    // against the rows without a fixture.
+    assert_eq!(
+        rows(&body),
+        vec![vec![65.0; EMBEDDING_WIDTH], vec![66.0; EMBEDDING_WIDTH]]
+    );
+
+    // a prompt of token ids, which is how a client that tokenized piece by piece
+    // sends it. no token is added: the rows are the ids that were sent.
+    let (_, body) = embed(&s, EMBEDDING_PATH, serde_json::json!({"content": [7, 300, 9]}));
+    assert_eq!(
+        rows(&body).iter().map(|r| r[0]).collect::<Vec<f64>>(),
+        vec![7.0, 300.0, 9.0]
+    );
+    // llama-server serves the same reply on the plural route.
+    let (status, body) = embed(&s, "/embeddings", serde_json::json!({"content": "A"}));
+    assert_eq!((status, rows(&body).len()), (200, 1));
+}
+
+#[test]
+fn a_scripted_vector_is_the_last_position() {
+    let s = Server::spawn(&[FLAG_LLAMACPP, FLAG_POOLING, "none"]);
+    embed(&s, LLAMA_EMBEDDINGS_PATH, serde_json::json!({"vector": [1.5, -2.0, 0.25]}));
+    let (_, body) = embed(&s, EMBEDDING_PATH, serde_json::json!({"content": "AB"}));
+    // the other positions take the scripted vector's width, so a reply is one
+    // rectangular matrix as it is on the real server.
+    assert_eq!(rows(&body), vec![vec![65.0; 3], vec![1.5, -2.0, 0.25]]);
+
+    // the queue held one spec, so the next request is the derived state again.
+    let (_, body) = embed(&s, EMBEDDING_PATH, serde_json::json!({"content": "AB"}));
+    assert_eq!(rows(&body)[1], vec![66.0; EMBEDDING_WIDTH]);
+}
+
+#[test]
+fn pooling_none_is_refused_on_the_openai_route() {
+    // llama-server's own refusal, which is how a client learns it has to read
+    // the native route. the spec it did not read stays queued.
+    let s = Server::spawn(&[FLAG_LLAMACPP, FLAG_POOLING, "none"]);
+    embed(&s, LLAMA_EMBEDDINGS_PATH, serde_json::json!({"vector": [3.0]}));
+    let (status, body) = embed(&s, OAI_EMBEDDINGS_PATH, serde_json::json!({"input": "AB"}));
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        json(&body)["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Pooling type 'none' is not OAI compatible")),
+        "{body}"
+    );
+    let (_, body) = embed(&s, EMBEDDING_PATH, serde_json::json!({"content": "AB"}));
+    assert_eq!(rows(&body)[1], vec![3.0]);
+}
+
+#[test]
+fn pooling_last_returns_one_vector_and_the_token_count() {
+    let s = Server::spawn(&[FLAG_LLAMACPP, FLAG_POOLING, "last"]);
+    embed(&s, LLAMA_EMBEDDINGS_PATH, serde_json::json!({"vector": [3.0, 4.0]}));
+    let (status, body) = embed(
+        &s,
+        OAI_EMBEDDINGS_PATH,
+        serde_json::json!({"input": "hello", "embd_normalize": -1}),
+    );
+    assert_eq!(status, 200, "{body}");
+    let v = json(&body);
+    assert_eq!(floats(&v["data"][0]["embedding"]), vec![3.0, 4.0]);
+    // the count the pooled reply would otherwise hide, in the units the prompt
+    // was sent in: one token per byte.
+    assert_eq!(v["usage"]["prompt_tokens"].as_u64(), Some(5));
+    assert_eq!(v["usage"]["total_tokens"].as_u64(), Some(5));
+
+    // the native route answers the same vector as a matrix of one row.
+    embed(&s, LLAMA_EMBEDDINGS_PATH, serde_json::json!({"vector": [3.0, 4.0]}));
+    let (_, body) = embed(
+        &s,
+        EMBEDDING_PATH,
+        serde_json::json!({"content": "hello", "embd_normalize": -1}),
+    );
+    assert_eq!(rows(&body), vec![vec![3.0, 4.0]]);
+}
+
+#[test]
+fn a_pooled_vector_is_normalised_unless_the_request_declines() {
+    // llama-server's default is the euclidean norm. a head is trained on the raw
+    // state, so a client that forgets to decline gets a vector that points the
+    // right way and has the wrong length, and this is how a test sees that.
+    let s = Server::spawn(&[FLAG_LLAMACPP, FLAG_POOLING, "last"]);
+    embed(&s, LLAMA_DEFAULT_EMBEDDING_PATH, serde_json::json!({"vector": [3.0, 4.0]}));
+    s.req("PUT", LLAMA_DEFAULT_EMBEDDING_PATH, r#"{"vector":[3.0,4.0]}"#);
+    let (_, body) = embed(&s, OAI_EMBEDDINGS_PATH, serde_json::json!({"input": "hello"}));
+    let unit = floats(&json(&body)["data"][0]["embedding"]);
+    assert!(approx(unit[0], 0.6) && approx(unit[1], 0.8), "{body}");
+    let (_, body) = embed(
+        &s,
+        OAI_EMBEDDINGS_PATH,
+        serde_json::json!({"input": "hello", "embd_normalize": -1}),
+    );
+    assert_eq!(floats(&json(&body)["data"][0]["embedding"]), vec![3.0, 4.0]);
+}
+
+#[test]
+fn the_default_embedding_answers_until_it_is_cleared() {
+    // a client verifies a head with several requests before it serves one, so
+    // "answer this way until told otherwise" needs saying once.
+    let s = Server::spawn(&[FLAG_LLAMACPP, FLAG_POOLING, "none"]);
+    assert_eq!(
+        s.req("PUT", LLAMA_DEFAULT_EMBEDDING_PATH, r#"{"vector":[9.0,9.5]}"#).0,
+        200
+    );
+    for _ in 0..2 {
+        let (_, body) = embed(&s, EMBEDDING_PATH, serde_json::json!({"content": "AB"}));
+        assert_eq!(rows(&body)[1], vec![9.0, 9.5]);
+    }
+    // a queued spec still comes first, and the default resumes after it.
+    embed(&s, LLAMA_EMBEDDINGS_PATH, serde_json::json!({"vector": [1.0, 2.0]}));
+    let (_, body) = embed(&s, EMBEDDING_PATH, serde_json::json!({"content": "AB"}));
+    assert_eq!(rows(&body)[1], vec![1.0, 2.0]);
+    let (_, body) = embed(&s, EMBEDDING_PATH, serde_json::json!({"content": "AB"}));
+    assert_eq!(rows(&body)[1], vec![9.0, 9.5]);
+
+    let (_, body) = s.get(LLAMA_DEFAULT_EMBEDDING_PATH);
+    assert!(body.contains("9.5"), "the default is not reported: {body}");
+    s.req("DELETE", LLAMA_DEFAULT_EMBEDDING_PATH, "");
+    let (_, body) = embed(&s, EMBEDDING_PATH, serde_json::json!({"content": "AB"}));
+    assert_eq!(rows(&body)[1], vec![66.0; EMBEDDING_WIDTH]);
+}
+
+#[test]
+fn an_embedding_spec_that_is_not_a_vector_is_refused() {
+    let s = Server::spawn(&[FLAG_LLAMACPP, FLAG_POOLING, "none"]);
+    for bad in [r#"{"vector":"wide"}"#, r#"{"vector":[]}"#, r#"{"vector":[1,"two"]}"#] {
+        let (status, body) = s.post(LLAMA_EMBEDDINGS_PATH, bad);
+        assert_eq!(status, 400, "a bad spec was accepted: {bad} -> {body}");
+    }
+    let (_, body) = s.get(LLAMA_EMBEDDINGS_PATH);
+    assert_eq!(
+        json(&body)["embeddings"].as_array().map(|a| a.len()),
+        Some(0),
+        "a refused spec was kept: {body}"
+    );
+}
+
+#[test]
+fn an_embedding_spec_can_inject_a_failure() {
+    let s = Server::spawn(&[FLAG_LLAMACPP, FLAG_POOLING, "last"]);
+    embed(
+        &s,
+        LLAMA_EMBEDDINGS_PATH,
+        serde_json::json!({"error": "model is loading", "status": 503}),
+    );
+    let (status, body) = embed(&s, OAI_EMBEDDINGS_PATH, serde_json::json!({"input": "A"}));
+    assert_eq!(status, 503);
+    assert_eq!(json(&body)["error"].as_str(), Some("model is loading"));
+}
+
+#[test]
+fn an_embedding_request_without_a_prompt_is_refused() {
+    let s = Server::spawn(&[FLAG_LLAMACPP, FLAG_POOLING, "none"]);
+    let (status, _) = embed(&s, EMBEDDING_PATH, serde_json::json!({"nothing": true}));
+    assert_eq!(status, 400);
+    let (status, _) = embed(&s, EMBEDDING_PATH, serde_json::json!({"content": ""}));
+    assert_eq!(status, 400, "an empty prompt has no position to return");
+}
+
+#[test]
+fn embeddings_are_reachable_behind_llama_swap_and_reset_with_the_rest() {
+    let s = Server::spawn(&[FLAG_LLAMACPP, FLAG_POOLING, "last", "--llamaswap"]);
+    embed(&s, LLAMA_EMBEDDINGS_PATH, serde_json::json!({"vector": [2.0, 0.0]}));
+    let (status, body) = embed(
+        &s,
+        "/upstream/fake-model/v1/embeddings",
+        serde_json::json!({"input": "A", "embd_normalize": -1}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(floats(&json(&body)["data"][0]["embedding"]), vec![2.0, 0.0]);
+    let (status, body) = embed(
+        &s,
+        "/upstream/fake-model/embedding",
+        serde_json::json!({"content": "A", "embd_normalize": -1}),
+    );
+    assert_eq!((status, rows(&body).len()), (200, 1), "{body}");
+
+    // a reset empties this queue with the others, and the pooling is a
+    // behavior a caller can change without a restart.
+    embed(&s, LLAMA_EMBEDDINGS_PATH, serde_json::json!({"vector": [5.0]}));
+    s.post("/__admin/reset", "{}");
+    let (_, body) = s.get(LLAMA_EMBEDDINGS_PATH);
+    assert_eq!(json(&body)["embeddings"].as_array().map(|a| a.len()), Some(0));
+    s.post("/__admin/behavior", r#"{"pooling":"none"}"#);
+    let (_, body) = embed(&s, EMBEDDING_PATH, serde_json::json!({"content": "AB"}));
+    assert_eq!(rows(&body).len(), 2);
+}
+

@@ -85,6 +85,11 @@ or set the provider `base_url` / `baseURL` in the harness config to the same val
   generating text. behind `--llamacpp`, **default off**; see "llama.cpp native
   api".
 
+- `POST /embedding`, `POST /embeddings`, `POST /v1/embeddings` -- the same
+  server as an EMBEDDING server, for a client that reads hidden states and
+  applies a decision head itself. behind `--llamacpp --pooling none|last`,
+  **default off**.
+
 any other path returns 404 with an `endpoints` listing of what is served (so a
 bare `GET /v1` is a discovery aid, not a model list). a family gated off is not in
 the listing either: advertising `/props` while disabled advertises a lie.
@@ -179,6 +184,42 @@ health check and not a rounding error to tidy away. an empty queue answers the
 first label with all the mass; `n_probs` defaults to 64 when a request omits it.
 native errors are a bare `{"error": "..."}` STRING, not openai's error object --
 the two shapes are not interchangeable.
+
+### hidden states: the same server as an embedding server
+
+some decision models do not answer through their logits at all. they are trained
+with a head of their own, and a client fetches the final HIDDEN STATE from a
+llama-server started in embedding mode and applies the head itself. `--pooling
+none|last` (or behavior `pooling`, with `--llamacpp`; **default off**) serves
+that:
+
+- `POST /embedding`, `POST /embeddings` -- native. the prompt is `content`: text
+  (one token per byte) or an array of token ids, and no token is added. under
+  `none` the reply is `[{"index": 0, "embedding": [[...], ...]}]`, a row per
+  token; under `last` it is one row.
+- `POST /v1/embeddings` -- openai. the prompt is `input`. under `last` it answers
+  `data[0].embedding` as one flat vector with `usage.prompt_tokens`; under `none`
+  it answers llama-server's own 400, `Pooling type 'none' is not OAI compatible`,
+  which is how a client learns to read the native route.
+
+a row is DERIVED from its token: the id repeated across the width. so a client
+that reads spans of positions can check the rows it got against the ids it sent,
+with no fixture. the last position is the one a head reads, and that one is
+scripted through a third FIFO:
+
+```json
+// POST /__admin/embeddings
+{"vector": [0.5, -1.25, 3.0]}                 // the state at the last position
+{"status": 503, "error": "model is loading"}  // a failing backend
+```
+
+the scripted vector sets the width of the whole reply; an unscripted reply is 8
+wide. `PUT /__admin/default_embedding` answers the reads the queue does not
+cover, which a client that verifies its head with several requests before
+serving one needs. under `last` the vector is scaled to unit length unless the
+request sends `embd_normalize: -1`, as on the real server: a client that forgets
+to decline gets a vector pointing the right way with the wrong length, and that
+is a bug worth being able to see. under `none` nothing is normalised.
 
 ## programming responses
 
@@ -327,6 +368,13 @@ the `/__admin` namespace shares the port and is never itself captured.
 | GET | /__admin/default_probs | - | the scoring fallback, or null when built-in |
 | PUT | /__admin/default_probs | spec | set the empty-queue scoring answer |
 | DELETE | /__admin/default_probs | - | restore the built-in scoring answer |
+| GET | /__admin/embeddings | - | the pending EMBEDDING queue (llama.cpp `/embedding`) |
+| POST | /__admin/embeddings | spec or [spec] | append; `{ok, pending}`, or 400 when `vector` is not numbers |
+| PUT | /__admin/embeddings | [spec] | replace the embedding queue |
+| DELETE | /__admin/embeddings | - | clear the embedding queue |
+| GET | /__admin/default_embedding | - | the embedding fallback, or null when derived |
+| PUT | /__admin/default_embedding | spec | set the empty-queue embedding answer |
+| DELETE | /__admin/default_embedding | - | restore the derived embedding answer |
 | GET | /__admin/default | - | the fallback spec, or null when built-in |
 | PUT | /__admin/default | spec | set the empty-queue fallback |
 | DELETE | /__admin/default | - | restore the built-in `ok` fallback |

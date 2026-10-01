@@ -62,3 +62,12 @@ product requirements for `fake-openai`. these must not regress in a release.
     out to the requested width is what keeps "outside the top k" distinguishable
     from "probability zero", and a client that reads option mass has to be able to
     script a distribution that is mostly somewhere else.
+17. answer an embedding request as `llama.cpp` started as an embedding server
+    does, under a chosen pooling: a hidden state per prompt token on the native
+    routes under `none`, and the last position alone under `last`, on the native
+    routes and on `/v1/embeddings` with the prompt's token count. the last
+    position is exactly the vector that was scripted, every other one is derived
+    from its token id, a pooled vector is normalised unless the request declines,
+    and the openai route refuses pooling `none` in the real server's words. a
+    client that applies a decision head has to be able to script the state the
+    head reads and to check the rows against the tokens it sent.

@@ -24,6 +24,11 @@ pub struct Behavior {
     // what /props reports as chat_template, which a client derives its prompt
     // affixes from. None keeps a minimal chatml template.
     pub chat_template: Option<String>,
+    // the pooling of a llama-server started as an EMBEDDING server, which a
+    // client reading a model through a decision head fetches hidden states from:
+    // `none` answers every position, `last` the final one alone. None keeps the
+    // embedding routes closed, as a server started without --embeddings has them.
+    pub pooling: Option<String>,
     pub stall_first_with_tools: bool,
     pub stall_seconds: u64,
     pub heartbeat_sentinel: String,
@@ -87,6 +92,7 @@ impl Default for Behavior {
         Behavior {
             llamacpp: false,
             chat_template: None,
+            pooling: None,
             stall_first_with_tools: false,
             stall_seconds: DEFAULT_STALL_SECONDS,
             heartbeat_sentinel: HEARTBEAT_SENTINEL.to_string(),

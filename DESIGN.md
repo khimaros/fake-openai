@@ -39,6 +39,8 @@ tiny_http accept (one thread per request)
        GET  /props                 -> handlers::llama::Props      (--llamacpp)
        POST /tokenize              -> handlers::llama::Tokenize   (--llamacpp)
        POST /completion            -> handlers::llama::Completion (--llamacpp)
+       POST /embedding[s], /v1/embeddings -> handlers::llama::Embedding
+                                             (--llamacpp --pooling)
        (no match)                  -> 404 with an endpoint listing
   -> non-admin: pay connect_delay_ms (slow-first-byte injection), then capture
   -> write response; ignore broken pipe
@@ -119,6 +121,29 @@ labels is testing the option-mass health check, so renormalising would answer a
 question that was not asked. `timings.prompt_n` is derived from the request for
 the same reason `context_window` derives usage: a fixed number cannot express
 prefix reuse.
+
+`--pooling` turns the same server into an EMBEDDING server, for a client that
+reads a model through a decision head: it fetches hidden states and applies the
+head itself, so the thing a test has to choose is a hidden state. the family is
+gated on the pooling as well as on `--llamacpp`, because a real llama-server
+answers these routes only when started for them, and a mock that always did
+could not show a client pointed at the wrong kind of server.
+
+only the LAST position is scripted (`State::embeddings`, a third queue with its
+own default). that is the position a head is trained to read, and scripting a
+whole matrix per request would make a spec as long as its prompt. every other
+position is derived from its token id, the same move as the byte vocabulary: a
+client that reads spans of positions, as a head scoring options by where they
+sit does, can check what came back against what it sent without a fixture, and
+an off-by-one in its span arithmetic shows up as the wrong ids in its rows.
+
+the two poolings differ in what the real server does, and the mock keeps each
+difference because a client has to cope with both: `none` answers every
+position on the native routes, ignores normalisation, and is refused on the
+openai route in llama-server's own words; `last` answers one vector on both,
+normalises it unless the request declines, and is the only one that reports a
+token count. a refused openai request leaves the queue untouched, so the spec
+is still there for the native request a client falls back to.
 
 the audio family (`handlers::audio`) covers pi-omni's voice paths: speech returns
 deterministic pcm (raw, or sse `speech.audio.delta` frames when the request asks
