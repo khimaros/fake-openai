@@ -1,8 +1,7 @@
 // http message types shared across the server: the parsed inbound request, the
 // outbound response, and the fixed fallback stream.
 
-use std::collections::VecDeque;
-use std::io::{self, Read};
+use std::io::{self, Write};
 use std::thread;
 use std::time::Duration;
 
@@ -127,78 +126,57 @@ pub fn write_response(req: Request, resp: HttpResponse) {
             let _ = req.respond(out);
         }
         Body::Streamed { frames, hang_ms } => {
-            // chunked transfer (data_length = None) lets tiny_http write the headers
-            // up front, frame each read() as its own chunk, and own connection
-            // teardown. FrameReader paces the reads, so a client observes real
-            // inter-delta timing and a stream that ends without [DONE] when the spec
-            // truncates or hangs. writing the head by hand instead starves a strict
-            // client (e.g. undici) of headers and stalls it.
-            let headers = vec![
-                header("Content-Type", &resp.content_type),
-                header("Cache-Control", "no-cache"),
-            ];
-            let reader = FrameReader::new(frames, hang_ms);
-            let _ = req.respond(Response::new(
-                StatusCode(resp.status),
-                headers,
-                reader,
-                None,
-                None,
-            ));
+            // a client that hangs up mid-stream is normal in tests; ignore the error.
+            let _ = write_streamed(req, resp.status, &resp.content_type, frames, hang_ms);
         }
     }
+}
+
+// a paced body, written by hand as chunked transfer: the head at once, then each frame as its
+// own chunk after its lead delay, FLUSHED, then an optional idle hold before the terminator.
+//
+// NOT THROUGH `Request::respond`, which this used to do with a reader that slept between
+// frames. tiny_http copies a chunked body through an encoder that holds 8k before it writes,
+// so every delay was honoured and then the whole stream went out in one burst at the end: the
+// total time was right and the pacing a client was meant to observe did not exist. the head is
+// flushed FIRST and whole, because a strict client (undici) waits on headers before it will
+// read a body at all.
+fn write_streamed(
+    req: Request,
+    status: u16,
+    content_type: &str,
+    frames: Vec<Frame>,
+    hang_ms: u64,
+) -> io::Result<()> {
+    let mut out = req.into_writer();
+    let reason = StatusCode(status).default_reason_phrase();
+    write!(
+        out,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    )?;
+    out.flush()?;
+    for frame in frames {
+        if frame.delay_ms > 0 {
+            thread::sleep(Duration::from_millis(frame.delay_ms));
+        }
+        if frame.data.is_empty() {
+            // a zero-length chunk is the terminator, and would end the stream early.
+            continue;
+        }
+        write!(out, "{:x}\r\n", frame.data.len())?;
+        out.write_all(&frame.data)?;
+        out.write_all(b"\r\n")?;
+        out.flush()?;
+    }
+    // frames exhausted: hold once (idle), then end the stream.
+    if hang_ms > 0 {
+        thread::sleep(Duration::from_millis(hang_ms));
+    }
+    out.write_all(b"0\r\n\r\n")?;
+    out.flush()
 }
 
 fn header(field: &str, value: &str) -> Header {
     Header::from_bytes(field.as_bytes(), value.as_bytes()).expect("valid header")
-}
-
-// a Read that emits each frame's bytes after sleeping the frame's lead delay,
-// then optionally holds (hang_ms) before signaling end of stream. tiny_http drives
-// it via io::copy through a chunked encoder, so each frame becomes one paced chunk.
-struct FrameReader {
-    frames: VecDeque<Frame>,
-    current: Vec<u8>,
-    pos: usize,
-    hang_ms: u64,
-    hung: bool,
-}
-
-impl FrameReader {
-    fn new(frames: Vec<Frame>, hang_ms: u64) -> FrameReader {
-        FrameReader {
-            frames: frames.into(),
-            current: Vec::new(),
-            pos: 0,
-            hang_ms,
-            hung: false,
-        }
-    }
-}
-
-impl Read for FrameReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // drain whatever remains of the current frame first.
-        if self.pos < self.current.len() {
-            let n = (self.current.len() - self.pos).min(buf.len());
-            buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
-            self.pos += n;
-            return Ok(n);
-        }
-        // advance to the next frame, sleeping its lead delay.
-        if let Some(frame) = self.frames.pop_front() {
-            if frame.delay_ms > 0 {
-                thread::sleep(Duration::from_millis(frame.delay_ms));
-            }
-            self.current = frame.data;
-            self.pos = 0;
-            return self.read(buf);
-        }
-        // frames exhausted: hold once (idle), then end the stream.
-        if self.hang_ms > 0 && !self.hung {
-            self.hung = true;
-            thread::sleep(Duration::from_millis(self.hang_ms));
-        }
-        Ok(0)
-    }
 }

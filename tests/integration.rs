@@ -410,6 +410,72 @@ fn programmed_reasoning_chunks_stream_one_delta_each() {
     assert_eq!(v["choices"][0]["message"]["reasoning_content"], "think more now");
 }
 
+// the `tool_calls` deltas of a streamed body, one json value per delta.
+fn tool_call_deltas(body: &str) -> Vec<Value> {
+    body.lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .map(json)
+        .filter_map(|v| v["choices"][0]["delta"].get("tool_calls").cloned())
+        .flat_map(|calls| calls.as_array().cloned().unwrap_or_default())
+        .collect()
+}
+
+// a real model writes a tool call's arguments a token at a time: the call is announced with
+// its id and name and no arguments, then the argument text arrives in pieces. a harness that
+// shows a call as it is written can only be tested against a stream shaped like that.
+#[test]
+fn programmed_tool_call_chunks_stream_the_arguments_in_pieces() {
+    const ARGS: &str = "{\\\"path\\\":\\\"a.py\\\",\\\"content\\\":\\\"x = 1 \\u00e9\\\"}";
+    let spec = format!(
+        "{{\"tool_calls\":[{{\"id\":\"c1\",\"type\":\"function\",\"index\":0,\
+         \"function\":{{\"name\":\"write\",\"arguments\":\"{ARGS}\"}}}}],\
+         \"tool_call_chunks\":4,\"finish_reason\":\"tool_calls\"}}"
+    );
+    let whole = "{\"path\":\"a.py\",\"content\":\"x = 1 \u{e9}\"}";
+    let s = Server::spawn(&[]);
+    s.post("/__admin/responses", &spec);
+    let (status, body) = s.post(CHAT_PATH, &chat_body(true, false, true));
+    assert_eq!(status, 200);
+    let deltas = tool_call_deltas(&body);
+    // the announcement: who is calling what, and nothing of the arguments yet.
+    assert_eq!(deltas[0]["id"], "c1", "{body}");
+    assert_eq!(deltas[0]["function"]["name"], "write");
+    assert_eq!(deltas[0]["function"]["arguments"], "");
+    // then the arguments, in the pieces asked for, each naming its call by index alone.
+    let pieces: Vec<&str> = deltas[1..]
+        .iter()
+        .map(|d| d["function"]["arguments"].as_str().unwrap())
+        .collect();
+    assert_eq!(pieces.len(), 4, "expected 4 argument deltas: {body}");
+    assert!(pieces.iter().all(|p| !p.is_empty()), "an empty piece: {pieces:?}");
+    assert_eq!(pieces.concat(), whole, "the pieces must rejoin to the arguments");
+    assert!(
+        deltas[1..].iter().all(|d| d["index"] == 0 && d.get("id").is_none()),
+        "a continuation carries the index and not the id: {body}"
+    );
+    // a non-stream request gets the call whole: there is nothing to pace.
+    s.post("/__admin/responses", &spec);
+    let (_, jbody) = s.post(CHAT_PATH, &chat_body(true, false, false));
+    let call = &json(&jbody)["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(call["function"]["arguments"], whole);
+}
+
+// without `tool_call_chunks` a tool call still arrives in one delta, as it always has.
+#[test]
+fn programmed_tool_calls_stream_whole_by_default() {
+    let s = Server::spawn(&[]);
+    s.post(
+        "/__admin/responses",
+        "{\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"index\":0,\
+         \"function\":{\"name\":\"x\",\"arguments\":\"{\\\"a\\\":1}\"}}]}",
+    );
+    let (_, body) = s.post(CHAT_PATH, &chat_body(true, false, true));
+    let deltas = tool_call_deltas(&body);
+    assert_eq!(deltas.len(), 1, "{body}");
+    assert_eq!(deltas[0]["function"]["arguments"], "{\"a\":1}");
+}
+
 #[test]
 fn programmed_raw_body_verbatim() {
     let s = Server::spawn(&[]);
@@ -1015,6 +1081,55 @@ fn chunk_delay_paces_streamed_deltas() {
         start.elapsed()
     );
     assert!(body.contains("\"content\":\"c\""), "{body}");
+}
+
+// THE DELTAS HAVE TO ARRIVE APART, not merely take long enough in total. the test above passes
+// for a server that sleeps between frames and then sends them all at once -- which this one
+// did, because the http layer buffered a chunked body until it ended. a client watching for
+// incremental output saw one burst after the whole delay, which is not pacing at all.
+#[test]
+fn chunk_delay_spaces_the_deltas_on_the_wire() {
+    let s = Server::spawn(&[]);
+    s.post(
+        "/__admin/responses",
+        "{\"chunks\":[\"a\",\"b\",\"c\",\"d\"],\"chunk_delay_ms\":150}",
+    );
+    let body = chat_body(false, false, true);
+    let mut stream = TcpStream::connect(&s.addr).expect("connect");
+    stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let raw = format!(
+        "POST {CHAT_PATH} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        s.addr,
+        body.len()
+    );
+    stream.write_all(raw.as_bytes()).unwrap();
+    // when each delta was first seen, by its content.
+    let start = Instant::now();
+    let mut seen = Vec::new();
+    let mut resp = String::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        resp.push_str(&String::from_utf8_lossy(&buf[..n]));
+        for piece in ["a", "b", "c", "d"] {
+            let marker = format!("\"content\":\"{piece}\"");
+            if resp.contains(&marker) && !seen.iter().any(|(p, _)| *p == piece) {
+                seen.push((piece, start.elapsed()));
+            }
+        }
+    }
+    assert_eq!(seen.len(), 4, "not every delta arrived: {resp}");
+    let (first, last) = (seen[0].1, seen[3].1);
+    // three gaps of 150ms lie between the first delta and the last.
+    assert!(
+        last - first >= Duration::from_millis(400),
+        "the deltas arrived together ({seen:?}); a paced stream must deliver each as it is due"
+    );
+    assert!(resp.contains("[DONE]"), "{resp}");
 }
 
 #[test]

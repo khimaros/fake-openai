@@ -6,9 +6,13 @@ use std::io::Write;
 use serde_json::{json, Value};
 
 use crate::audio_probe;
+use crate::cache;
 use crate::handlers::audio::TRANSCRIPTIONS_PATH;
 use crate::response::ParsedRequest;
 use crate::state::Shared;
+
+// the part of a path that makes a request a chat completion (the handler's own test).
+const CHAT_PATH: &str = "chat/completions";
 
 pub fn record(state: &Shared, req: &ParsedRequest) {
     // AND WHAT THE AUDIO WAS, for a request that carries some. `body` is lossy for binary, so a
@@ -28,11 +32,23 @@ pub fn record(state: &Shared, req: &ParsedRequest) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    // AND WHAT A PREFIX CACHE WOULD HAVE MADE OF IT, for a chat request (see cache.rs). null for
+    // everything else.
+    let cache = if req.path.contains(CHAT_PATH) {
+        let prompt = cache::Prompt::of(&req.body);
+        let mut seen = state.prompts.lock().unwrap();
+        let said = cache::report(&prompt, &seen);
+        seen.push(prompt);
+        said
+    } else {
+        Value::Null
+    };
     let entry = json!({
         "path": req.path,
         "headers": req.headers,
         "body": req.body,
         "audio": audio,
+        "cache": cache,
         "at_ms": at_ms,
     });
     state.captures.lock().unwrap().push(entry.clone());

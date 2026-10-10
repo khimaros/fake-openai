@@ -283,6 +283,7 @@ error and timeout handling:
 
 ```json
 {"chunks": ["one ", "two ", "three"], "chunk_delay_ms": 50}
+{"tool_calls": [{"id": "c1", "type": "function", "index": 0, "function": {"name": "write", "arguments": "{\"path\": \"a.py\"}"}}], "tool_call_chunks": 8, "chunk_delay_ms": 50}
 {"error": {"message": "rate limited", "type": "rate_limit_error"}, "status": 429}
 {"content": "half a sente", "truncate": true}
 {"content": "...", "hang_ms": 30000, "truncate": true}
@@ -290,6 +291,10 @@ error and timeout handling:
 
 - `chunks` streams one content delta per element (joined for a non-stream
   request), exercising a client's incremental delta handling.
+- `tool_call_chunks` streams each tool call the way a model writes one: the call
+  is announced with its id and name and empty arguments, then its argument text
+  arrives in that many deltas, paced by `chunk_delay_ms`. without it (or for a
+  non-stream request) a call goes out whole.
 - `error` returns an openai-style `{"error": {...}}` body with the given `status`
   (a bare 200 becomes 400), even for a streaming request.
 - `truncate` ends a stream with no finish frame or `[DONE]`, then closes the
@@ -392,6 +397,23 @@ every non-admin request is captured as `{path, headers, body}`. read it via
 fake-openai --log-file captures.jsonl   # one capture per line
 fake-openai --log-stdout                # same jsonl on stdout
 ```
+
+### what a prefix cache would have done
+
+a chat capture also carries `cache`, what a server that reuses an evaluated prompt (llama.cpp)
+would have made of the request:
+
+```
+"cache": {"prompt_chars": 5210, "cached_chars": 4890, "diverged": null}
+```
+
+`cached_chars` is the longest prefix the prompt shares with ANY earlier chat request, with the
+prompt rendered tools first and then the messages in order. `diverged` names the first piece
+that differs from that earlier request, `{"in": "tools" | "messages", "index": n}`, or is null
+when the request only adds to it. a conversation that keeps its cache has `diverged: null` on
+every turn after the first; one whose client reordered its tools or rewrote an early message
+has a `diverged` near the start and a small `cached_chars`. the figures are characters of this
+rendering, not tokens of any model. `POST /__admin/reset` forgets the earlier requests.
 
 ## stall and heartbeat
 

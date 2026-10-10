@@ -28,6 +28,8 @@ pub struct ResponseSpec {
     reasoning_chunks: Option<Vec<String>>,
     chunks: Option<Vec<String>>,
     tool_calls: Option<Value>,
+    // how many deltas each tool call's arguments stream in. 0 or 1 sends the call whole.
+    tool_call_chunks: u64,
     error: Option<Value>,
     finish_reason: Option<String>,
     usage: Option<Value>,
@@ -56,6 +58,7 @@ impl ResponseSpec {
             reasoning_chunks: string_vec(v, "reasoning_chunks"),
             chunks: string_vec(v, "chunks"),
             tool_calls: v.get("tool_calls").cloned(),
+            tool_call_chunks: u64_field(v, "tool_call_chunks"),
             error: v.get("error").cloned(),
             finish_reason: str_field(v, "finish_reason"),
             usage: v.get("usage").cloned(),
@@ -103,6 +106,7 @@ impl ResponseSpec {
         m.insert("status".to_string(), json!(self.status));
         m.insert("delay_ms".to_string(), json!(self.delay_ms));
         m.insert("chunk_delay_ms".to_string(), json!(self.chunk_delay_ms));
+        m.insert("tool_call_chunks".to_string(), json!(self.tool_call_chunks));
         m.insert("hang_ms".to_string(), json!(self.hang_ms));
         m.insert("truncate".to_string(), json!(self.truncate));
         Value::Object(m)
@@ -164,18 +168,19 @@ impl ResponseSpec {
         }
         // one content delta per piece; tool_calls and the leading role ride the
         // first delta. with no pieces, still emit a single role delta.
+        let (announced, argument_deltas) = self.tool_call_pieces();
         if pieces.is_empty() {
-            frames.push(frame(0, self.delta_chunk(None, self.tool_calls.clone())));
+            frames.push(frame(0, self.delta_chunk(None, announced)));
         } else {
             for (i, piece) in pieces.iter().enumerate() {
                 let delay = if i == 0 { 0 } else { self.chunk_delay_ms };
-                let tc = if i == 0 {
-                    self.tool_calls.clone()
-                } else {
-                    None
-                };
+                let tc = if i == 0 { announced.clone() } else { None };
                 frames.push(frame(delay, self.delta_chunk(Some(piece), tc)));
             }
+        }
+        // then each call's arguments, a piece at a time, the way a model writes them.
+        for delta in argument_deltas {
+            frames.push(frame(self.chunk_delay_ms, self.delta_chunk(None, Some(delta))));
         }
         // a truncated stream stops here: no finish frame, no [DONE].
         if !self.truncate {
@@ -221,6 +226,37 @@ impl ResponseSpec {
         } else {
             vec![]
         }
+    }
+
+    // the tool calls as a stream delivers them: what the first delta announces, and the
+    // argument deltas that follow it.
+    //
+    // with `tool_call_chunks` above one, the announcement names each call (id, type, name)
+    // with EMPTY arguments, and each call's argument text then arrives in that many pieces,
+    // one call after another, each delta carrying only the call's index -- which is how an
+    // openai-compatible endpoint streams a call a model is still writing. otherwise the
+    // calls go out whole in the announcement and nothing follows.
+    fn tool_call_pieces(&self) -> (Option<Value>, Vec<Value>) {
+        let calls = match &self.tool_calls {
+            Some(Value::Array(calls)) if self.tool_call_chunks > 1 => calls,
+            _ => return (self.tool_calls.clone(), vec![]),
+        };
+        let mut announced = calls.clone();
+        let mut deltas = Vec::new();
+        for (i, call) in announced.iter_mut().enumerate() {
+            let index = call.get("index").cloned().unwrap_or(json!(i));
+            let Some(args) = call.pointer_mut("/function/arguments") else {
+                continue;
+            };
+            let Some(text) = args.as_str().map(String::from) else {
+                continue;
+            };
+            *args = json!("");
+            for piece in split_text(&text, self.tool_call_chunks as usize) {
+                deltas.push(json!([{"index": index, "function": {"arguments": piece}}]));
+            }
+        }
+        (Some(Value::Array(announced)), deltas)
     }
 
     // the reasoning delivered, split into streamed pieces: `reasoning_chunks` if
@@ -379,6 +415,14 @@ fn string_vec(v: &Value, key: &str) -> Option<Vec<String>> {
             .map(|x| x.as_str().unwrap_or_default().to_string())
             .collect(),
     )
+}
+
+// `text` cut into at most `n` non-empty pieces of near-equal length, on character
+// boundaries so a multi-byte character is never split across two deltas.
+fn split_text(text: &str, n: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let size = chars.len().div_ceil(n.max(1)).max(1);
+    chars.chunks(size).map(|c| c.iter().collect()).collect()
 }
 
 fn frame(delay_ms: u64, data: String) -> Frame {

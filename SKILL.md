@@ -113,6 +113,8 @@ and timeout handling:
 ```
 
 - `chunks`: stream one content delta per element (joined for a non-stream request).
+- `tool_call_chunks`: with `tool_calls`, announce each call with empty arguments
+  and then stream its argument text in that many deltas, paced by `chunk_delay_ms`.
 - `error`: return an openai `{"error": {...}}` body with `status` (a bare 200
   becomes 400), even for a streaming request.
 - `truncate`: end a stream with no finish frame or `[DONE]`, then close the socket.

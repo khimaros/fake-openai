@@ -48,8 +48,11 @@ tiny_http accept (one thread per request)
 
 a response is either buffered (written in one shot, the common path) or streamed.
 the streamed path takes raw control of the socket via `Request::into_writer`,
-writes a `Connection: close` head, then writes each frame after sleeping its
-delay, and closes on drop. only a stream that needs pacing (`chunk_delay_ms`),
+writes and flushes a `Connection: close`, chunked head, then writes each frame
+as its own chunk after sleeping its delay, FLUSHING each one, and closes on
+drop. the flush is the point: handing a sleeping reader to `Request::respond`
+honours every delay and still delivers the body in one burst, because tiny_http
+buffers a chunked body before writing it. only a stream that needs pacing (`chunk_delay_ms`),
 truncation (`truncate`), or an idle hold (`hang_ms`) takes this path; an
 unpaced/uncut stream stays buffered and byte-identical to the old single write.
 
@@ -193,6 +196,12 @@ can test its own error and timeout handling:
   json error -- matching how a real endpoint rejects before emitting tokens.
 - `chunks` renders one content delta per element instead of one combined delta,
   so a client's incremental delta handling is exercised; non-stream joins them.
+- `tool_call_chunks` does the same for a tool call's arguments. the first delta
+  names each call (id, type, name) with empty arguments; each call's argument text
+  then follows in that many deltas carrying only the call's index, one call after
+  another, cut on character boundaries. that is the shape an openai-compatible
+  endpoint streams while a model is still writing a call, which a single whole
+  delta cannot exercise.
 - `truncate` ends a stream after its content frames with no finish frame or
   `[DONE]`, then closes the socket: a simulated aborted upstream.
 - `chunk_delay_ms` sleeps between streamed deltas; `hang_ms` holds the socket open

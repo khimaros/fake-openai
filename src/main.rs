@@ -4,6 +4,7 @@
 mod admin;
 mod audio_probe;
 mod behavior;
+mod cache;
 mod capture;
 mod config;
 mod handlers;

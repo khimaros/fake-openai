@@ -42,6 +42,8 @@ pub struct State {
     /// before it serves one, which a queue of one cannot answer.
     pub default_embedding: Mutex<Option<EmbeddingSpec>>,
     pub stalled_once: Mutex<bool>,
+    /// every chat prompt seen, for what a prefix cache would make of the next (see cache.rs).
+    pub prompts: Mutex<Vec<crate::cache::Prompt>>,
     pub models: Mutex<Vec<Value>>,
     /// Names enrolled through `POST /v1/voices`. THE REGISTRY REMEMBERS, because
     /// the one failure a re-run hits is that the name it picked last time is
@@ -107,6 +109,7 @@ impl State {
             })),
             behavior: Mutex::new(c.behavior.clone()),
             stalled_once: Mutex::new(false),
+            prompts: Mutex::new(Vec::new()),
             models: Mutex::new(c.models.clone()),
             voices: Mutex::new(BTreeSet::new()),
             log_file: Mutex::new(log_file),
@@ -155,6 +158,7 @@ impl State {
         self.probs.lock().unwrap().clear();
         self.embeddings.lock().unwrap().clear();
         *self.stalled_once.lock().unwrap() = false;
+        self.prompts.lock().unwrap().clear();
     }
 
     /// Enrol a voice, refusing a name already taken unless `force`. True when it
